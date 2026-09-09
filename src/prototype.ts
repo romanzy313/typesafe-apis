@@ -1,4 +1,4 @@
-export type Codec<TInput> = {
+export type Codec<TInput = unknown> = {
   encode(data: TInput): unknown;
   decode(encoded: unknown): TInput;
 };
@@ -54,22 +54,26 @@ export type TypedResponse<TStatus extends StatusCode, TResponseBody> = {
   body: TResponseBody;
 };
 
+type ContractResponse<TResponses extends Record<StatusCode, Codec>> = {
+  [TStatus in StatusCode]: TypedResponse<
+    TStatus,
+    ReturnType<TResponses[TStatus]["decode"]>
+  >;
+}[StatusCode];
+
 export function serverContractHandler<
-  TParams extends Codec,
-  TQuery extends Codec,
-  TRequestBody extends Codec,
-  TResponse extends Record<StatusCode, Codec>,
-  TContract extends Contract<TParams, TQuery, TRequestBody, TResponse>,
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses extends Record<StatusCode, Codec>,
 >(
-  c: TContract,
+  c: Contract<Codec<TParams>, Codec<TQuery>, Codec<TRequestBody>, TResponses>,
   handler: (
-    req: TypedRequest<TParams, TQuery, TRequestBody>,
-  ) => Promise<TypedResponse<TResponse>>,
+    req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
+  ) => Promise<ContractResponse<NoInfer<TResponses>>>,
 ) {
   function validateRequest(req: RequestExtract) {
     return {
-      method: c.method,
-      path: c.path,
       params: c.params.decode(req.params),
       query: c.query.decode(req.query),
       body: c.request.decode(req.body),
@@ -77,7 +81,7 @@ export function serverContractHandler<
   }
   function validateResponse(res: ResponseExtract) {
     const codec = c.responses[res.status];
-    if (!codec) throw new Error(`No decoder for status ${res.status}`);
+    if (!codec) throw new Error(`No encoder for status ${res.status}`);
 
     return {
       status: res.status,
@@ -90,7 +94,6 @@ export function serverContractHandler<
     path: c.path, // for server router
     handler, // for testing
     async fetch(req: Request) {
-      // extract complete request
       const requestExtract = await extractJsonRequest(req, c.path);
 
       const typedRequest = validateRequest(requestExtract);
@@ -108,28 +111,35 @@ async function extractJsonRequest(
   req: Request,
   path: string,
 ): Promise<RequestExtract> {
-  /**
-   * extracts params and query values from from the request
-   */
-  function extractParamAndQuery(url: string, path: string) {
-    return {
-      params: {},
-      query: {},
-    };
+  const url = new URL(req.url);
+  const pathSegments = path.split("/");
+  const requestSegments = url.pathname.split("/");
+
+  if (pathSegments.length !== requestSegments.length) {
+    throw new Error(`Request path does not match ${path}`);
   }
 
-  const { params, query } = extractParamAndQuery(req.url, path);
-  const body = await req.json();
+  const params = Object.fromEntries(
+    pathSegments.flatMap((segment, index) => {
+      const value = requestSegments[index];
+      if (segment.startsWith(":")) {
+        if (!value) throw new Error(`Request path does not match ${path}`);
+        return [[segment.slice(1), decodeURIComponent(value)]];
+      }
+      if (segment !== value) {
+        throw new Error(`Request path does not match ${path}`);
+      }
+      return [];
+    }),
+  );
 
   return {
     params,
-    query,
-    body,
+    query: Object.fromEntries(url.searchParams),
+    body: req.body === null ? undefined : await req.json(),
   };
 }
 
-function createJsonResponse(body: any, status: number): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-  });
+function createJsonResponse(body: unknown, status: StatusCode): Response {
+  return Response.json(body, { status });
 }

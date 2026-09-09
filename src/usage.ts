@@ -37,7 +37,7 @@ const h = serverContractHandler(example, async (req) => {
   return {
     status: 200,
     body: {
-      notWorking: "",
+      hi: "",
       pathParam: req.params.pathParam,
       queryParam: req.query.queryParam,
       requestParam: req.body.requestParam,
