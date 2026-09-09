@@ -3,6 +3,7 @@ import {
   contract,
   serverContractHandler,
   type Codec,
+  type StatusCode,
   type TypedRequest,
 } from "./prototype.js";
 
@@ -88,6 +89,61 @@ describe("serverContractHandler", () => {
     expect(await response.json()).toEqual(body);
     expect(c.responses[400].encode).toHaveBeenCalledExactlyOnceWith(body);
     expect(c.responses[200].encode).not.toHaveBeenCalled();
+  });
+
+  it("supports a contract declaring only status 201", async () => {
+    const original = createContract();
+    const c = contract({
+      ...original,
+      responses: { 201: original.responses[200] },
+    });
+    const endpoint = serverContractHandler(c, async () => ({
+      status: 201,
+      body: date,
+    }));
+
+    const response = await endpoint.fetch(createRequest());
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toBe(date.toISOString());
+    expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<{
+      status: 201;
+      body: Date;
+    }>();
+  });
+
+  it.each([404, 500] as const)(
+    "supports status %s in a contract declaring only error responses",
+    async (status) => {
+      const original = createContract();
+      const c = contract({
+        ...original,
+        responses: {
+          404: original.responses[400],
+          500: original.responses[400],
+        },
+      });
+      const body = { error: "Request failed" };
+      const endpoint = serverContractHandler(c, async () => ({ status, body }));
+
+      const response = await endpoint.fetch(createRequest());
+
+      expect(response.status).toBe(status);
+      expect(await response.json()).toEqual(body);
+    },
+  );
+
+  it("rejects undeclared statuses returned by an untyped handler", async () => {
+    const handler = async () => ({
+      status: 500 as const,
+      body: { error: "Request failed" },
+    });
+    // @ts-expect-error Status 500 is standard but absent from this contract.
+    const endpoint = serverContractHandler(createContract(), handler);
+
+    await expect(endpoint.fetch(createRequest())).rejects.toThrow(
+      "No encoder for status 500",
+    );
   });
 
   it("extracts multiple decoded path parameters and query values", async () => {
@@ -213,10 +269,70 @@ describe("serverContractHandler", () => {
 });
 
 describe("serverContractHandler types", () => {
+  it("accepts Hono status codes and excludes codes outside its declaration", () => {
+    expectTypeOf<
+      100 | 103 | 207 | 226 | 308 | 418 | 425 | 451 | 507 | 511
+    >().toExtend<StatusCode>();
+    expectTypeOf<
+      Extract<StatusCode, 99 | 104 | 209 | 309 | 419 | 509 | 600>
+    >().toBeNever();
+  });
+
+  it("infers response bodies only for the declared subset", () => {
+    const original = createContract();
+    const c = contract({
+      ...original,
+      responses: {
+        201: original.responses[200],
+        503: original.responses[400],
+      },
+    });
+    const endpoint = serverContractHandler(c, async (req) => {
+      if (req.body.enabled) {
+        return { status: 201, body: date };
+      }
+      return { status: 503, body: { error: "Unavailable" } };
+    });
+
+    expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
+      { status: 201; body: Date } | { status: 503; body: { error: string } }
+    >();
+
+    // @ts-expect-error Status 200 is not declared by this contract.
+    serverContractHandler(c, async () => ({ status: 200, body: date }));
+
+    // @ts-expect-error Status 201 requires a Date, not the error body.
+    serverContractHandler(c, async () => ({
+      status: 201,
+      body: { error: "x" },
+    }));
+
+    // @ts-expect-error Status 503 requires the error body, not a Date.
+    serverContractHandler(c, async () => ({ status: 503, body: date }));
+  });
+
+  it("rejects response maps containing status codes absent from Hono", () => {
+    const original = createContract();
+    const invalid = {
+      ...original,
+      responses: { ...original.responses, 104: original.responses[200] },
+    };
+
+    // @ts-expect-error Status 104 is absent from Hono's StatusCode.
+    contract(invalid);
+
+    // @ts-expect-error Direct handler construction also rejects status 104.
+    serverContractHandler(invalid, async () => ({ status: 200, body: date }));
+  });
+
   it("infers decoded request values and status-specific response bodies", () => {
     const endpoint = serverContractHandler(createContract(), async (req) => {
       expectTypeOf(req).toEqualTypeOf<
-        TypedRequest<{ id: number }, { filter: "a" | "b" }, { enabled: boolean }>
+        TypedRequest<
+          { id: number },
+          { filter: "a" | "b" },
+          { enabled: boolean }
+        >
       >();
 
       if (req.body.enabled) {
@@ -226,8 +342,7 @@ describe("serverContractHandler types", () => {
     });
 
     expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
-      | { status: 200; body: Date }
-      | { status: 400; body: { error: string } }
+      { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
     expectTypeOf(endpoint.fetch).toEqualTypeOf<
       (request: Request) => Promise<Response>
@@ -259,7 +374,10 @@ describe("serverContractHandler types", () => {
     serverContractHandler(c, async () => ({ status: 201, body: date }));
 
     // @ts-expect-error Status 200 requires a Date, not the error body.
-    serverContractHandler(c, async () => ({ status: 200, body: { error: "x" } }));
+    serverContractHandler(c, async () => ({
+      status: 200,
+      body: { error: "x" },
+    }));
 
     // @ts-expect-error Status 400 requires the error body, not a Date.
     serverContractHandler(c, async () => ({ status: 400, body: date }));
