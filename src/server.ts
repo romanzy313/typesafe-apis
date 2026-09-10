@@ -33,10 +33,15 @@ export function serverContractHandler<
   TRequestBody,
   TResponses extends ResponseCodecs,
 >(
-  c: Contract<Codec<TParams>, Codec<TQuery>, Codec<TRequestBody>, TResponses>,
+  contract: Contract<
+    Codec<TParams>,
+    Codec<TQuery>,
+    Codec<TRequestBody>,
+    TResponses
+  >,
   handler: ServerHandler<TParams, TQuery, TRequestBody, TResponses>["handler"],
 ): ServerHandler<TParams, TQuery, TRequestBody, TResponses> {
-  const { definition } = c;
+  const { definition } = contract;
   if (!definition.route) {
     throw new Error("Contract must define a route with .route()");
   }
