@@ -3,7 +3,7 @@ import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
-import { serverContractHandler } from "./server.js";
+import { serverEndpoint } from "./server.js";
 
 const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   decode: Number,
@@ -111,7 +111,8 @@ describe("contract composition", () => {
           }),
         ),
       );
-    const endpoint = serverContractHandler(final, async (req) => {
+    const builder = serverEndpoint().contract(final);
+    const endpoint = builder.handler(async (req) => {
       expectTypeOf(req.params).toEqualTypeOf<{ id: number }>();
       expectTypeOf(req.query).toEqualTypeOf<
         { page: number } & { action: "read" | "forbidden" | "disabled" }
@@ -131,10 +132,13 @@ describe("contract composition", () => {
     });
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      fetch: endpoint.fetch,
+      fetch: (request) => endpoint.fetchWithContext(request, {}),
     }).contract(final);
 
-    expectTypeOf(fetchItem).toEqualTypeOf<typeof endpoint.handler>();
+    type Handler = Parameters<typeof builder.handler>[0];
+    expectTypeOf(fetchItem).toEqualTypeOf<
+      (req: Parameters<Handler>[0]) => ReturnType<Handler>
+    >();
     expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
       | { status: 200; body: { id: number; page: number } }
       | {
@@ -180,17 +184,17 @@ describe("contract composition", () => {
       body: undefined,
     });
     // @ts-expect-error The disabled variant requires data.
-    serverContractHandler(final, async () => ({
+    serverEndpoint().contract(final).handler(async () => ({
       status: 403,
       body: { error: "disabled" },
     }));
     // @ts-expect-error A discriminator cannot be added by the handler.
-    serverContractHandler(final, async () => ({
+    serverEndpoint().contract(final).handler(async () => ({
       status: 403,
       body: { error: "other" },
     }));
     // @ts-expect-error This status was not declared by the contract.
-    serverContractHandler(final, async () => ({
+    serverEndpoint().contract(final).handler(async () => ({
       status: 401,
       body: { error: "unauthorized" },
     }));
@@ -211,7 +215,7 @@ describe("contract composition", () => {
     const ready = base.route("GET", "/items/:id", params);
     expect(() => {
       // @ts-expect-error A base contract has no route.
-      serverContractHandler(base, handler);
+      serverEndpoint().contract(base).handler(handler);
     }).toThrow("Contract must define a route with .route()");
     expect(() => {
       // @ts-expect-error A base contract has no route.
@@ -219,7 +223,7 @@ describe("contract composition", () => {
     }).toThrow("Contract must define a route with .route()");
     expect(() => {
       // @ts-expect-error A new contract has no route.
-      serverContractHandler(contract(), async () => {
+      serverEndpoint().contract(contract()).handler(async () => {
         throw new Error("Must not run");
       });
     }).toThrow("Contract must define a route with .route()");
@@ -227,7 +231,7 @@ describe("contract composition", () => {
       // @ts-expect-error A new contract has no route.
       client.contract(contract());
     }).toThrow("Contract must define a route with .route()");
-    expect(() => serverContractHandler(ready, handler)).not.toThrow();
+    expect(() => serverEndpoint().contract(ready).handler(handler)).not.toThrow();
     expect(() => client.contract(ready)).not.toThrow();
     expect(handler).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
@@ -237,13 +241,14 @@ describe("contract composition", () => {
     const c = contract()
       .route("GET", "/empty", zodCodec(z.object({})))
       .response(200, zodCodec(z.object({ ok: z.boolean() })));
-    const endpoint = serverContractHandler(c, async (req) => {
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async (req) => {
       expect(req).toEqual({ params: {}, query: {}, body: undefined });
       return { status: 200, body: { ok: true } };
     });
     const fetchEmpty = createClient({
       baseUrl: "https://example.com",
-      fetch: endpoint.fetch,
+      fetch: (request) => endpoint.fetchWithContext(request, {}),
     }).contract(c);
 
     await expect(
@@ -278,13 +283,19 @@ describe("contract composition", () => {
     expectTypeOf(query.decode).returns.toEqualTypeOf<
       { page: string } & { page: number } & { filter: string }
     >();
-    const endpoint = serverContractHandler(c, async (req) => {
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async (req) => {
       expectTypeOf(req.query.page).toBeNever();
       return { status: 200, body: { ok: true } };
     });
-    const fetchItem = createClient({ fetch: endpoint.fetch }).contract(c);
+    const fetchItem = createClient({
+      fetch: (request) => endpoint.fetchWithContext(request, {}),
+    }).contract(c);
 
-    expectTypeOf(fetchItem).toEqualTypeOf<typeof endpoint.handler>();
+    type Handler = Parameters<typeof builder.handler>[0];
+    expectTypeOf(fetchItem).toEqualTypeOf<
+      (req: Parameters<Handler>[0]) => ReturnType<Handler>
+    >();
     expectTypeOf(fetchItem).toBeCallableWith({
       params: { id: 1 },
       // @ts-expect-error The conflicting page field must not disappear.

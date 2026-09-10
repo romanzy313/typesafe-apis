@@ -1,5 +1,6 @@
 import { assert, describe, expect, expectTypeOf, it } from "vitest";
 import { createClient } from "../client.js";
+import type { ContractResponse } from "../types.js";
 import { exampleContract } from "./contract.js";
 import { exampleHandler } from "./serverHandler.js";
 
@@ -20,7 +21,7 @@ describe("example end-to-end", () => {
         expect(request.headers.get("content-type")).toBe("application/json");
         expect(await request.clone().json()).toEqual({ requestParam: true });
 
-        const response = await exampleHandler.fetch(request);
+        const response = await exampleHandler.fetchWithContext(request, {});
 
         expect(response.status).toBe(200);
         expect(response.headers.get("content-type")).toBe("application/json");
@@ -29,7 +30,9 @@ describe("example end-to-end", () => {
       },
     }).contract(exampleContract);
 
-    expectTypeOf(fetchExample).toEqualTypeOf<typeof exampleHandler.handler>();
+    expectTypeOf(fetchExample).returns.resolves.toEqualTypeOf<
+      ContractResponse<typeof exampleHandler.definition.responses>
+    >();
 
     const response = await fetchExample({
       params: { pathParam: 42.5 },
@@ -47,7 +50,7 @@ describe("example end-to-end", () => {
   it("returns the server's declared business error through the client", async () => {
     const fetchExample = createClient({
       baseUrl: "https://example.com",
-      fetch: exampleHandler.fetch,
+      fetch: (request) => exampleHandler.fetchWithContext(request, {}),
     }).contract(exampleContract);
 
     const response = await fetchExample({

@@ -3,11 +3,9 @@ import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
-import {
-  contractHandler,
-  endpoint,
-  type MiddlewareHandler,
-} from "./endpoint.js";
+import { createMiddleware, type MiddlewareHandler } from "./middleware.js";
+import { contractHandler, serverEndpoint } from "./server.js";
+import type { TypedRequest } from "./types.js";
 
 const stringToNumber = z.codec(z.string(), z.number(), {
   decode: Number,
@@ -30,21 +28,23 @@ const serverContext: Readonly<ServerContext> = Object.freeze({
   userName: "Ada",
 });
 
-const authenticate: MiddlewareHandler<
-  unknown,
-  { fail: boolean },
-  unknown,
-  typeof authContract.definition.responses,
+const authenticate = createMiddleware<
   { userName: string },
   TraceContext,
   AuthContext
-> = async (req, server, context, next) => {
-  expectTypeOf(context.traceId).toEqualTypeOf<string>();
-  if (req.query.fail) {
-    return { status: 403, body: { error: "auth_please" } };
-  }
-  return next({ user: { name: server.userName } });
-};
+>()(
+  {
+    query: authContract.definition.query,
+    responses: authContract.definition.responses,
+  },
+  async (req, server, context, next) => {
+    expectTypeOf(context.traceId).toEqualTypeOf<string>();
+    if (req.query.fail) {
+      return { status: 403, body: { error: "auth_please" } };
+    }
+    return next({ user: { name: server.userName } });
+  },
+);
 
 function createRequest(id = 7, fail = false) {
   return new Request(`https://example.com/test/${id}?fail=${fail}`, {
@@ -55,17 +55,160 @@ function createRequest(id = 7, fail = false) {
 }
 
 function tracedEndpoint() {
-  return endpoint<ServerContext>()
+  return serverEndpoint<ServerContext>()
     .contract(testContract)
     .use<TraceContext>(async (req, _server, _context, next) =>
       next({ traceId: `request-${req.params.id}` }),
     );
 }
 
-describe("endpoint", () => {
+describe("createMiddleware", () => {
+  it("infers decoded requirements and preserves explicit context types", () => {
+    const middleware = createMiddleware<
+      ServerContext,
+      TraceContext,
+      AuthContext
+    >()(testContract.definition, async (req, server, context, next) => {
+      expectTypeOf(req).toEqualTypeOf<
+        TypedRequest<{ id: number }, { fail: boolean }, { name: string }>
+      >();
+      expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
+      expectTypeOf(context).toEqualTypeOf<TraceContext>();
+      expectTypeOf(next).parameter(0).toEqualTypeOf<AuthContext>();
+      return next({ user: { name: server.userName } });
+    });
+
+    expectTypeOf(middleware).toEqualTypeOf<
+      MiddlewareHandler<
+        { id: number },
+        { fail: boolean },
+        { name: string },
+        typeof testContract.definition.responses,
+        ServerContext,
+        TraceContext,
+        AuthContext
+      >
+    >();
+    tracedEndpoint().use(middleware);
+  });
+
+  it("allows middleware without request or response requirements", async () => {
+    const middleware = createMiddleware()(
+      {},
+      async (req, server, context, next) => {
+        expectTypeOf(req).toEqualTypeOf<
+          TypedRequest<unknown, unknown, unknown>
+        >();
+        expectTypeOf(server).toEqualTypeOf<Readonly<{}>>();
+        expectTypeOf(context).toEqualTypeOf<{}>();
+        return next({});
+      },
+    );
+    const bound = serverEndpoint()
+      .contract(testContract)
+      .use(middleware)
+      .handler(async (req) => ({
+        status: 200,
+        body: { hello: req.body.name },
+      }));
+
+    const response = await bound.fetchWithContext(createRequest(), {});
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ hello: "world" });
+  });
+
+  it("does not narrow request requirements from callback annotations", () => {
+    const nextOnly = async () => {
+      throw new Error("Type test only");
+    };
+    const withParams = async (_req: { params: { id: string } }) => nextOnly();
+    const withQuery = async (_req: { query: { fail: true } }) => nextOnly();
+    const withBody = async (_req: { body: { name: number } }) => nextOnly();
+
+    createMiddleware()(
+      { params: testContract.definition.params },
+      // @ts-expect-error The codec decodes id to a number.
+      withParams,
+    );
+    createMiddleware()(
+      { query: authContract.definition.query },
+      // @ts-expect-error The codec can decode fail to either boolean value.
+      withQuery,
+    );
+    createMiddleware()(
+      { request: testContract.definition.request },
+      // @ts-expect-error The codec decodes name to a string.
+      withBody,
+    );
+  });
+
+  it("rejects responses not declared by its requirements", () => {
+    const requirements = { responses: authContract.definition.responses };
+
+    createMiddleware()(
+      requirements,
+      // @ts-expect-error Only the declared 403 response is allowed.
+      async () => ({ status: 200 as const, body: { hello: "world" } }),
+    );
+    createMiddleware()(
+      requirements,
+      // @ts-expect-error The declared error is the literal auth_please.
+      async () => ({ status: 403 as const, body: { error: "other" as const } }),
+    );
+    createMiddleware()(
+      {},
+      // @ts-expect-error Without response requirements middleware must use next.
+      async () => ({ status: 403 as const, body: { error: "auth_please" } }),
+    );
+    createMiddleware()(
+      // @ts-expect-error Status 104 is absent from Hono's StatusCode.
+      { responses: { ...requirements.responses, 104: zodCodec(z.string()) } },
+      async (_req, _server, _context, next) => next({}),
+    );
+  });
+});
+
+describe("middleware composition", () => {
+  it.each([false, true])(
+    "runs middleware for typed requests with fail=%s",
+    async (fail) => {
+      const handlerCalled = vi.fn();
+      const bound = tracedEndpoint()
+        .use(authenticate)
+        .handler(async (req, server, context) => {
+          handlerCalled();
+          expect(server).toBe(serverContext);
+          expect(context.traceId).toBe("request-7");
+          return {
+            status: 200,
+            body: {
+              hello: `${server.greeting} ${context.user.name}, ${req.body.name}`,
+            },
+          };
+        });
+
+      await expect(
+        bound.handle(
+          {
+            params: { id: 7 },
+            query: { fail },
+            body: { name: "world" },
+          },
+          serverContext,
+        ),
+      ).resolves.toEqual(
+        fail
+          ? { status: 403, body: { error: "auth_please" } }
+          : { status: 200, body: { hello: "Hello Ada, world" } },
+      );
+      expect(handlerCalled).toHaveBeenCalledTimes(fail ? 0 : 1);
+    },
+  );
+
   it("runs nested middleware through HTTP JSON", async () => {
     const order: string[] = [];
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       .use<TraceContext>(async (req, server, context, next) => {
         expect(context).toEqual({});
@@ -165,7 +308,7 @@ describe("endpoint", () => {
       .route("GET", "/other/:slug", zodCodec(z.object({ slug: z.string() })))
       .query(zodCodec(z.object({ locale: z.string() })))
       .response(201, zodCodec(z.object({ location: z.string() })));
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(otherContract)
       .use<TraceContext>(async (req, _server, _context, next) =>
         next({ traceId: req.params.slug }),
@@ -239,7 +382,7 @@ describe("endpoint", () => {
 
   it("starts concurrent requests with separate empty contexts", async () => {
     const contexts: object[] = [];
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       .use<{ requestId: number }>(async (req, server, context, next) => {
         expect(context).toEqual({});
@@ -256,15 +399,24 @@ describe("endpoint", () => {
         };
       });
 
-    const [first, second] = await Promise.all([
+    const [first, second, third] = await Promise.all([
       bound.fetchWithContext(createRequest(1), serverContext),
       bound.fetchWithContext(createRequest(2), serverContext),
+      bound.handle(
+        {
+          params: { id: 3 },
+          query: { fail: false },
+          body: { name: "world" },
+        },
+        serverContext,
+      ),
     ]);
 
-    expect(contexts).toHaveLength(2);
-    expect(contexts[0]).not.toBe(contexts[1]);
+    expect(contexts).toHaveLength(3);
+    expect(new Set(contexts).size).toBe(3);
     expect(await first.json()).toEqual({ hello: "Hello:1" });
     expect(await second.json()).toEqual({ hello: "Hello:2" });
+    expect(third).toEqual({ status: 200, body: { hello: "Hello:3" } });
     expect(serverContext).toEqual({ greeting: "Hello", userName: "Ada" });
   });
 
@@ -291,7 +443,7 @@ describe("endpoint", () => {
 
   it("validates the request before calling middleware", async () => {
     const called = vi.fn();
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       .use(async (_req, _server, _context, next) => {
         called();
@@ -313,7 +465,7 @@ describe("endpoint", () => {
     "propagates %s failures",
     async (source) => {
       const error = new Error("Request failed");
-      const bound = endpoint<ServerContext>()
+      const bound = serverEndpoint<ServerContext>()
         .contract(testContract)
         .use(async (_req, _server, _context, next) => {
           if (source === "middleware") throw error;
@@ -326,11 +478,21 @@ describe("endpoint", () => {
       await expect(
         bound.fetchWithContext(createRequest(), serverContext),
       ).rejects.toBe(error);
+      await expect(
+        bound.handle(
+          {
+            params: { id: 7 },
+            query: { fail: false },
+            body: { name: "world" },
+          },
+          serverContext,
+        ),
+      ).rejects.toBe(error);
     },
   );
 
   it("rejects undeclared middleware responses", async () => {
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       // @ts-expect-error Status 500 is not declared by the contract.
       .use(async () => ({ status: 500 as const, body: { error: "failed" } }))
@@ -342,7 +504,7 @@ describe("endpoint", () => {
   });
 
   it("validates a short-circuited response body", async () => {
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       // @ts-expect-error The declared error is the literal auth_please.
       .use(async () => ({ status: 403 as const, body: { error: 42 } }))
@@ -354,7 +516,7 @@ describe("endpoint", () => {
   });
 
   it("rejects middleware that returns no response", async () => {
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       // @ts-expect-error Middleware must return its own response or next().
       .use(async () => undefined)
@@ -367,7 +529,7 @@ describe("endpoint", () => {
 
   it("requires a route before binding a handler", () => {
     expect(() => {
-      endpoint<ServerContext>()
+      serverEndpoint<ServerContext>()
         // @ts-expect-error The base contract has no route.
         .contract(authContract)
         .handler(async () => ({
@@ -378,9 +540,9 @@ describe("endpoint", () => {
   });
 });
 
-describe("endpoint types", () => {
+describe("middleware types", () => {
   it("keeps server context readonly and types next context", () => {
-    const bound = endpoint<ServerContext>()
+    const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       .use<AuthContext>(async (_req, server, context, next) => {
         expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
@@ -406,6 +568,25 @@ describe("endpoint types", () => {
     expectTypeOf(bound.fetchWithContext).toEqualTypeOf<
       (request: Request, server: Readonly<ServerContext>) => Promise<Response>
     >();
+    expectTypeOf(bound.handle).parameter(1).toEqualTypeOf<
+      Readonly<ServerContext>
+    >();
+    const typedRequest = {
+      params: { id: 7 },
+      query: { fail: false },
+      body: { name: "world" },
+    };
+    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext);
+    // @ts-expect-error The server context is required for typed requests too.
+    expectTypeOf(bound.handle).toBeCallableWith(typedRequest);
+    // @ts-expect-error The server context must supply both configured fields.
+    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, {});
+    expectTypeOf(bound.handle).toBeCallableWith(
+      typedRequest,
+      serverContext,
+      // @ts-expect-error The request context is created internally.
+      { user: { name: "injected" } },
+    );
     const request = createRequest();
     const url = request.url;
     expectTypeOf(bound.fetchWithContext).toBeCallableWith(
@@ -421,7 +602,7 @@ describe("endpoint types", () => {
   });
 
   it("checks middleware context dependencies", () => {
-    const empty = endpoint<ServerContext>().contract(testContract);
+    const empty = serverEndpoint<ServerContext>().contract(testContract);
     // @ts-expect-error authenticate requires traceId in the request context.
     empty.use(authenticate);
 
@@ -440,7 +621,7 @@ describe("endpoint types", () => {
     // @ts-expect-error authenticate adds a string user name, not a number.
     tracedEndpoint().use<{ user: { name: number } }>(authenticate);
 
-    const missingServer = endpoint<{}>()
+    const missingServer = serverEndpoint<{}>()
       .contract(testContract)
       .use<TraceContext>(async (_req, _server, _context, next) =>
         next({ traceId: "id" }),
@@ -454,7 +635,7 @@ describe("endpoint types", () => {
       .route("GET", "/wrong", zodCodec(z.object({})))
       .query(zodCodec(z.object({ fail: z.string() })))
       .response(403, authContract.definition.responses[403]);
-    const wrongQuery = endpoint<ServerContext>()
+    const wrongQuery = serverEndpoint<ServerContext>()
       .contract(wrongQueryContract)
       .use<TraceContext>(async (_req, _server, _context, next) =>
         next({ traceId: "id" }),
@@ -466,7 +647,7 @@ describe("endpoint types", () => {
       .route("GET", "/missing", zodCodec(z.object({})))
       .query(authContract.definition.query)
       .response(200, zodCodec(z.string()));
-    const missingResponse = endpoint<ServerContext>()
+    const missingResponse = serverEndpoint<ServerContext>()
       .contract(missingResponseContract)
       .use<TraceContext>(async (_req, _server, _context, next) =>
         next({ traceId: "id" }),
@@ -474,7 +655,7 @@ describe("endpoint types", () => {
     // @ts-expect-error authenticate requires a response for status 403.
     missingResponse.use(authenticate);
 
-    const wrongResponse = endpoint<ServerContext>()
+    const wrongResponse = serverEndpoint<ServerContext>()
       .contract(missingResponseContract.response(403, zodCodec(z.number())))
       .use<TraceContext>(async (_req, _server, _context, next) =>
         next({ traceId: "id" }),

@@ -1,9 +1,9 @@
-import { serverContractHandler } from "../server.js";
+import { serverEndpoint } from "../server.js";
 import { exampleContract } from "./contract.js";
 
-export const exampleHandler = serverContractHandler(
-  exampleContract,
-  async (req) => {
+export const exampleHandler = serverEndpoint()
+  .contract(exampleContract)
+  .handler(async (req) => {
     if (!req.body.requestParam) {
       return { status: 400, body: { error: "requestParam must be true" } };
     }
@@ -17,5 +17,4 @@ export const exampleHandler = serverContractHandler(
         requestParam: req.body.requestParam,
       },
     };
-  },
-);
+  });

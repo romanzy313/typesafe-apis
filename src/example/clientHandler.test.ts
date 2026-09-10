@@ -6,7 +6,7 @@ import { exampleHandler } from "./serverHandler.js";
 
 const fetchExample = createClient({
   baseUrl: "https://example.com",
-  fetch: exampleHandler.fetch,
+  fetch: (request) => exampleHandler.fetchWithContext(request, {}),
 }).contract(exampleContract);
 
 describe("example client types", () => {

@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import z from "zod";
 import { exampleContract } from "./contract.js";
-import { serverContractHandler } from "../server.js";
+import { serverEndpoint } from "../server.js";
 import { exampleHandler } from "./serverHandler.js";
 import type { Codec } from "../types.js";
 import { zodCodec } from "../codec.js";
@@ -23,7 +23,7 @@ function createRequest(
 
 describe("example", () => {
   it("serves the successful JSON response using the shared contract", async () => {
-    const response = await exampleHandler.fetch(createRequest());
+    const response = await exampleHandler.fetchWithContext(createRequest(), {});
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
@@ -34,32 +34,19 @@ describe("example", () => {
     });
   });
 
-  it("serves the declared business error response", async () => {
-    const response = await exampleHandler.fetch(
-      createRequest("42", "b", { requestParam: false }),
+  it("returns a typed business error without HTTP serialization", async () => {
+    const response = await exampleHandler.handle(
+      {
+        params: { pathParam: 42 },
+        query: { queryParam: "b" },
+        body: { requestParam: false },
+      },
+      {},
     );
 
-    expect(response.status).toBe(400);
-    expect(await response.json()).toEqual({
-      error: "requestParam must be true",
-    });
-  });
-
-  it("supports testing the typed handler directly", async () => {
-    const response = await exampleHandler.handler({
-      params: { pathParam: 7 },
-      query: { queryParam: "b" },
-      body: { requestParam: true },
-    });
-
     expect(response).toEqual({
-      status: 200,
-      body: {
-        hi: "Hello",
-        pathParam: 7,
-        queryParam: "b",
-        requestParam: true,
-      },
+      status: 400,
+      body: { error: "requestParam must be true" },
     });
   });
 
@@ -91,7 +78,7 @@ describe("example", () => {
     },
   ])("rejects invalid $name values", async ({ path, query, body }) => {
     await expect(
-      exampleHandler.fetch(createRequest(path, query, body)),
+      exampleHandler.fetchWithContext(createRequest(path, query, body), {}),
     ).rejects.toBeInstanceOf(z.ZodError);
   });
 
@@ -99,12 +86,13 @@ describe("example", () => {
     "validates the response body for status %s at runtime",
     async (status) => {
       const untypedHandler = async () => ({ status, body: {} });
+      const builder = serverEndpoint().contract(exampleContract);
       // @ts-expect-error Simulate an untyped caller returning an invalid body.
-      const endpoint = serverContractHandler(exampleContract, untypedHandler);
+      const endpoint = builder.handler(untypedHandler);
 
-      await expect(endpoint.fetch(createRequest())).rejects.toBeInstanceOf(
-        z.ZodError,
-      );
+      await expect(
+        endpoint.fetchWithContext(createRequest(), {}),
+      ).rejects.toBeInstanceOf(z.ZodError);
     },
   );
 });
@@ -127,12 +115,12 @@ describe("example types", () => {
   });
 
   it("infers handler arguments and the complete response union", () => {
-    expectTypeOf(exampleHandler.handler).parameter(0).toEqualTypeOf<{
+    expectTypeOf(exampleHandler.handle).parameter(0).toEqualTypeOf<{
       params: { pathParam: number };
       query: { queryParam: "a" | "b" };
       body: { requestParam: boolean };
     }>();
-    expectTypeOf(exampleHandler.handler).returns.resolves.toEqualTypeOf<
+    expectTypeOf(exampleHandler.handle).returns.resolves.toEqualTypeOf<
       | {
           status: 200;
           body: {
@@ -148,7 +136,7 @@ describe("example types", () => {
 
   it("rejects the original example's missing response field", () => {
     // @ts-expect-error The success body requires hi, not notWorking.
-    serverContractHandler(exampleContract, async (req) => ({
+    serverEndpoint().contract(exampleContract).handler(async (req) => ({
       status: 200,
       body: {
         notWorking: "",

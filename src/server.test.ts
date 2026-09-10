@@ -1,9 +1,9 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
-import { type ServerHandler, serverContractHandler } from "./server.js";
-import type { MinFetch, StatusCode, TypedRequest } from "./types.js";
-import { contract } from "./contract.js";
 import { zodCodec } from "./codec.js";
+import { contract } from "./contract.js";
+import { serverEndpoint, type ServerEndpoint } from "./server.js";
+import type { StatusCode, TypedRequest } from "./types.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 
@@ -43,20 +43,42 @@ function createRequest(url = "https://example.com/items/42?filter=a") {
   });
 }
 
-describe("serverContractHandler", () => {
+describe("serverEndpoint", () => {
+  it("handles decoded values without running transport codecs", async () => {
+    const c = createContract();
+    const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
+    const endpoint = serverEndpoint().contract(c).handler(handler);
+    const request: Parameters<typeof endpoint.handle>[0] = {
+      params: { id: 7 },
+      query: { filter: "b" },
+      body: { enabled: false },
+    };
+
+    const response = await endpoint.handle(request, {});
+
+    expect(handler).toHaveBeenCalledExactlyOnceWith(request, {}, {});
+    expect(response).toEqual({ status: 200, body: date });
+    expect(response.body).toBe(date);
+    expect(c.definition.params.decode).not.toHaveBeenCalled();
+    expect(c.definition.query.decode).not.toHaveBeenCalled();
+    expect(c.definition.request.decode).not.toHaveBeenCalled();
+    expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
+    expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
+  });
+
   it("decodes requests and encodes responses with the selected codec", async () => {
     const c = createContract();
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
-    const endpoint = serverContractHandler(c, handler);
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(handler);
 
-    const response = await endpoint.fetch(createRequest());
+    const response = await endpoint.fetchWithContext(createRequest(), {});
 
     expect(endpoint.definition).toBe(c.definition);
     expect(endpoint.definition.route.method).toBe("POST");
     expect(endpoint.definition.route.path).toBe("/items/:id");
     expect(endpoint).not.toHaveProperty("method");
     expect(endpoint).not.toHaveProperty("path");
-    expect(endpoint.handler).toBe(handler);
     expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
       id: "42",
     });
@@ -66,11 +88,15 @@ describe("serverContractHandler", () => {
     expect(c.definition.request.decode).toHaveBeenCalledExactlyOnceWith({
       enabled: true,
     });
-    expect(handler).toHaveBeenCalledExactlyOnceWith({
-      params: { id: 42 },
-      query: { filter: "a" },
-      body: { enabled: true },
-    });
+    expect(handler).toHaveBeenCalledExactlyOnceWith(
+      {
+        params: { id: 42 },
+        query: { filter: "a" },
+        body: { enabled: true },
+      },
+      {},
+      {},
+    );
     expect(c.definition.responses[200].encode).toHaveBeenCalledExactlyOnceWith(
       date,
     );
@@ -84,12 +110,13 @@ describe("serverContractHandler", () => {
   it("uses the error response codec for status 400", async () => {
     const c = createContract();
     const body = { error: "Invalid item" };
-    const endpoint = serverContractHandler(c, async () => ({
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async () => ({
       status: 400,
       body,
     }));
 
-    const response = await endpoint.fetch(createRequest());
+    const response = await endpoint.fetchWithContext(createRequest(), {});
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual(body);
@@ -107,19 +134,18 @@ describe("serverContractHandler", () => {
         responses: { 201: original.definition.responses[200] },
       },
     };
-    const endpoint = serverContractHandler(c, async () => ({
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async () => ({
       status: 201,
       body: date,
     }));
 
-    const response = await endpoint.fetch(createRequest());
+    const response = await endpoint.fetchWithContext(createRequest(), {});
 
     expect(response.status).toBe(201);
     expect(await response.json()).toBe(date.toISOString());
-    expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<{
-      status: 201;
-      body: Date;
-    }>();
+    expectTypeOf(endpoint.handle)
+      .returns.resolves.toEqualTypeOf<{ status: 201; body: Date }>();
   });
 
   it.each([404, 500] as const)(
@@ -136,9 +162,10 @@ describe("serverContractHandler", () => {
         },
       };
       const body = { error: "Request failed" };
-      const endpoint = serverContractHandler(c, async () => ({ status, body }));
+      const builder = serverEndpoint().contract(c);
+      const endpoint = builder.handler(async () => ({ status, body }));
 
-      const response = await endpoint.fetch(createRequest());
+      const response = await endpoint.fetchWithContext(createRequest(), {});
 
       expect(response.status).toBe(status);
       expect(await response.json()).toEqual(body);
@@ -150,26 +177,29 @@ describe("serverContractHandler", () => {
       status: 500 as const,
       body: { error: "Request failed" },
     });
+    const builder = serverEndpoint().contract(createContract());
     // @ts-expect-error Status 500 is standard but absent from this contract.
-    const endpoint = serverContractHandler(createContract(), handler);
+    const endpoint = builder.handler(handler);
 
-    await expect(endpoint.fetch(createRequest())).rejects.toThrow(
-      "No encoder for status 500",
-    );
+    await expect(
+      endpoint.fetchWithContext(createRequest(), {}),
+    ).rejects.toThrow("No encoder for status 500");
   });
 
   it("extracts multiple decoded path parameters and query values", async () => {
     const c = createContract();
-    const endpoint = serverContractHandler(
-      c.route("POST", "/groups/:group/items/:id", c.definition.params),
-      async () => ({ status: 200, body: date }),
-    );
+    const endpoint = serverEndpoint()
+      .contract(
+        c.route("POST", "/groups/:group/items/:id", c.definition.params),
+      )
+      .handler(async () => ({ status: 200, body: date }));
 
-    await endpoint.fetch(
+    await endpoint.fetchWithContext(
       createRequest(
         "https://example.com/groups/a%2Fb/items/hello%20world" +
           "?filter=hello+world&extra=a%2Fb",
       ),
+      {},
     );
 
     expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
@@ -187,21 +217,29 @@ describe("serverContractHandler", () => {
     const request = zodCodec(z.undefined());
     vi.spyOn(request, "decode");
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
-    const endpoint = serverContractHandler(
-      c.route("GET", "/items", c.definition.params).request(request),
-      handler,
-    );
+    const endpoint = serverEndpoint()
+      .contract(
+        c.route("GET", "/items", c.definition.params).request(request),
+      )
+      .handler(handler);
 
-    await endpoint.fetch(new Request("https://example.com/items"));
+    await endpoint.fetchWithContext(
+      new Request("https://example.com/items"),
+      {},
+    );
 
     expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(request.decode).toHaveBeenCalledExactlyOnceWith(undefined);
-    expect(handler).toHaveBeenCalledExactlyOnceWith({
-      params: { id: 42 },
-      query: { filter: "a" },
-      body: undefined,
-    });
+    expect(handler).toHaveBeenCalledExactlyOnceWith(
+      {
+        params: { id: 42 },
+        query: { filter: "a" },
+        body: undefined,
+      },
+      {},
+      {},
+    );
   });
 
   it.each(["params", "query", "request"] as const)(
@@ -213,9 +251,12 @@ describe("serverContractHandler", () => {
         throw error;
       });
       const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
-      const endpoint = serverContractHandler(c, handler);
+      const builder = serverEndpoint().contract(c);
+      const endpoint = builder.handler(handler);
 
-      await expect(endpoint.fetch(createRequest())).rejects.toBe(error);
+      await expect(
+        endpoint.fetchWithContext(createRequest(), {}),
+      ).rejects.toBe(error);
       expect(handler).not.toHaveBeenCalled();
       expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
       expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
@@ -227,10 +268,14 @@ describe("serverContractHandler", () => {
     async (path) => {
       const c = createContract();
       const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
-      const endpoint = serverContractHandler(c, handler);
+      const builder = serverEndpoint().contract(c);
+      const endpoint = builder.handler(handler);
 
       await expect(
-        endpoint.fetch(createRequest(`https://example.com${path}`)),
+        endpoint.fetchWithContext(
+          createRequest(`https://example.com${path}`),
+          {},
+        ),
       ).rejects.toThrow("Request path does not match /items/:id");
       expect(handler).not.toHaveBeenCalled();
     },
@@ -238,14 +283,17 @@ describe("serverContractHandler", () => {
 
   it("rejects malformed JSON before calling the handler", async () => {
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
-    const endpoint = serverContractHandler(createContract(), handler);
+    const endpoint = serverEndpoint()
+      .contract(createContract())
+      .handler(handler);
 
     await expect(
-      endpoint.fetch(
+      endpoint.fetchWithContext(
         new Request("https://example.com/items/42", {
           method: "POST",
           body: "{",
         }),
+        {},
       ),
     ).rejects.toBeInstanceOf(SyntaxError);
     expect(handler).not.toHaveBeenCalled();
@@ -254,11 +302,14 @@ describe("serverContractHandler", () => {
   it("propagates handler failures without encoding a response", async () => {
     const c = createContract();
     const error = new Error("Handler failed");
-    const endpoint = serverContractHandler(c, async () => {
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async () => {
       throw error;
     });
 
-    await expect(endpoint.fetch(createRequest())).rejects.toBe(error);
+    await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
+      error,
+    );
     expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
     expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
   });
@@ -269,16 +320,19 @@ describe("serverContractHandler", () => {
     vi.mocked(c.definition.responses[200].encode).mockImplementation(() => {
       throw error;
     });
-    const endpoint = serverContractHandler(c, async () => ({
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async () => ({
       status: 200,
       body: date,
     }));
 
-    await expect(endpoint.fetch(createRequest())).rejects.toBe(error);
+    await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
+      error,
+    );
   });
 });
 
-describe("serverContractHandler types", () => {
+describe("serverEndpoint types", () => {
   it("accepts Hono status codes and excludes codes outside its declaration", () => {
     expectTypeOf<
       100 | 103 | 207 | 226 | 308 | 418 | 425 | 451 | 507 | 511
@@ -299,28 +353,30 @@ describe("serverContractHandler types", () => {
         },
       },
     };
-    const endpoint = serverContractHandler(c, async (req) => {
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async (req) => {
       if (req.body.enabled) {
         return { status: 201, body: date };
       }
       return { status: 503, body: { error: "Unavailable" } };
     });
 
-    expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
-      { status: 201; body: Date } | { status: 503; body: { error: string } }
-    >();
+    expectTypeOf(endpoint.handle)
+      .returns.resolves.toEqualTypeOf<
+        { status: 201; body: Date } | { status: 503; body: { error: string } }
+      >();
 
     // @ts-expect-error Status 200 is not declared by this contract.
-    serverContractHandler(c, async () => ({ status: 200, body: date }));
+    builder.handler(async () => ({ status: 200, body: date }));
 
     // @ts-expect-error Status 201 requires a Date, not the error body.
-    serverContractHandler(c, async () => ({
+    builder.handler(async () => ({
       status: 201,
       body: { error: "x" },
     }));
 
     // @ts-expect-error Status 503 requires the error body, not a Date.
-    serverContractHandler(c, async () => ({ status: 503, body: date }));
+    builder.handler(async () => ({ status: 503, body: date }));
   });
 
   it("rejects response maps containing status codes absent from Hono", () => {
@@ -338,13 +394,16 @@ describe("serverContractHandler types", () => {
     // @ts-expect-error Status 104 is absent from Hono's StatusCode.
     original.response(104, original.definition.responses[200]);
 
-    // @ts-expect-error Direct handler construction also rejects status 104.
-    serverContractHandler(invalid, async () => ({ status: 200, body: date }));
+    serverEndpoint()
+      // @ts-expect-error Direct handler construction also rejects status 104.
+      .contract(invalid)
+      .handler(async () => ({ status: 200, body: date }));
   });
 
   it("infers decoded request values and status-specific response bodies", () => {
     const c = createContract();
-    const endpoint = serverContractHandler(c, async (req) => {
+    const builder = serverEndpoint().contract(c);
+    const endpoint = builder.handler(async (req) => {
       expectTypeOf(req).toEqualTypeOf<
         TypedRequest<
           { id: number },
@@ -360,11 +419,12 @@ describe("serverContractHandler types", () => {
     });
 
     expectTypeOf(endpoint).toEqualTypeOf<
-      ServerHandler<
+      ServerEndpoint<
         { id: number },
         { filter: "a" | "b" },
         { enabled: boolean },
-        typeof c.definition.responses
+        typeof c.definition.responses,
+        {}
       >
     >();
     expectTypeOf(endpoint.definition.params.decode).returns.toEqualTypeOf<{
@@ -372,31 +432,67 @@ describe("serverContractHandler types", () => {
     }>();
     expectTypeOf(endpoint.definition.responses[200].decode)
       .returns.toEqualTypeOf<Date>();
-    expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
+    expectTypeOf<Parameters<typeof builder.handler>[0]>()
+      .returns.resolves.toEqualTypeOf<
+        { status: 200; body: Date } | { status: 400; body: { error: string } }
+      >();
+    expectTypeOf(endpoint.handle).parameters.toEqualTypeOf<[
+      TypedRequest<{ id: number }, { filter: "a" | "b" }, { enabled: boolean }>,
+      Readonly<{}>,
+    ]>();
+    expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
-    expectTypeOf(endpoint.fetch).toEqualTypeOf<MinFetch>();
-    const request = createRequest();
-    const url = new URL(request.url);
-    expectTypeOf(endpoint.fetch).toBeCallableWith(request);
-    // @ts-expect-error MinFetch requires a Request, not a URL string.
-    expectTypeOf(endpoint.fetch).toBeCallableWith(request.url);
-    // @ts-expect-error MinFetch requires a Request, not a URL object.
-    expectTypeOf(endpoint.fetch).toBeCallableWith(url);
-    // @ts-expect-error Request options must be supplied to the Request itself.
-    expectTypeOf(endpoint.fetch).toBeCallableWith(request, { method: "POST" });
-  });
-
-  it("narrows the response body by status", async () => {
-    const endpoint = serverContractHandler(createContract(), async () => ({
-      status: 200,
-      body: date,
-    }));
-    const response = await endpoint.handler({
+    const typedRequest: Parameters<typeof endpoint.handle>[0] = {
       params: { id: 42 },
       query: { filter: "a" },
       body: { enabled: true },
-    });
+    };
+    expectTypeOf(endpoint.handle).toBeCallableWith(typedRequest, {});
+    expectTypeOf(endpoint.handle).toBeCallableWith(
+      // @ts-expect-error handle requires decoded numeric parameters.
+      { ...typedRequest, params: { id: "42" } },
+      {},
+    );
+    expectTypeOf(endpoint.handle).toBeCallableWith(
+      // @ts-expect-error handle only accepts the declared query values.
+      { ...typedRequest, query: { filter: "c" } },
+      {},
+    );
+    expectTypeOf(endpoint.handle).toBeCallableWith(
+      // @ts-expect-error handle requires the declared request body.
+      { ...typedRequest, body: {} },
+      {},
+    );
+    expectTypeOf(endpoint.fetchWithContext).toEqualTypeOf<
+      (request: Request, serverContext: Readonly<{}>) => Promise<Response>
+    >();
+    const request = createRequest();
+    // @ts-expect-error Native Requests must go through fetchWithContext.
+    expectTypeOf(endpoint.handle).toBeCallableWith(request, {});
+    const url = new URL(request.url);
+    expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(request, {});
+    // @ts-expect-error The endpoint requires a Request, not a URL string.
+    expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(request.url, {});
+    // @ts-expect-error The endpoint requires a Request, not a URL object.
+    expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(url, {});
+    const options = { method: "POST" };
+    // @ts-expect-error Request options must be supplied to the Request itself.
+    expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(request, {}, options);
+  });
+
+  it("narrows the response body by status", async () => {
+    const endpoint = serverEndpoint()
+      .contract(createContract())
+      .handler(async () => ({ status: 200, body: date }));
+    const response = await endpoint.handle(
+      {
+        params: { id: 42 },
+        query: { filter: "a" },
+        body: { enabled: true },
+      },
+      {},
+    );
 
     if (response.status === 200) {
       expectTypeOf(response.body).toEqualTypeOf<Date>();
@@ -407,24 +503,25 @@ describe("serverContractHandler types", () => {
 
   it("rejects invalid handlers without widening the contract", () => {
     const c = createContract();
+    const builder = serverEndpoint().contract(c);
 
     // @ts-expect-error Status 201 is not declared by the contract.
-    serverContractHandler(c, async () => ({ status: 201, body: date }));
+    builder.handler(async () => ({ status: 201, body: date }));
 
     // @ts-expect-error Status 200 requires a Date, not the error body.
-    serverContractHandler(c, async () => ({
+    builder.handler(async () => ({
       status: 200,
       body: { error: "x" },
     }));
 
     // @ts-expect-error Status 400 requires the error body, not a Date.
-    serverContractHandler(c, async () => ({ status: 400, body: date }));
+    builder.handler(async () => ({ status: 400, body: date }));
 
     // @ts-expect-error The error response body must contain an error string.
-    serverContractHandler(c, async () => ({ status: 400, body: {} }));
+    builder.handler(async () => ({ status: 400, body: {} }));
 
     // @ts-expect-error The decoded path parameter is a number.
-    serverContractHandler(c, async (_req: { params: { id: string } }) => ({
+    builder.handler(async (_req: { params: { id: string } }) => ({
       status: 200,
       body: date,
     }));
