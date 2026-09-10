@@ -131,7 +131,7 @@ describe("contract composition", () => {
     });
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: endpoint.fetch,
+      fetch: endpoint.fetch,
     }).contract(final);
 
     expectTypeOf(fetchItem).toEqualTypeOf<typeof endpoint.handler>();
@@ -204,8 +204,8 @@ describe("contract composition", () => {
       status: 401 as const,
       body: { error: "unauthorized" as const },
     }));
-    const doRequest = vi.fn(async () => Response.json({}));
-    const client = createClient({ doRequest });
+    const fetch = vi.fn(async () => Response.json({}));
+    const client = createClient({ fetch });
 
     // Configuring a derived route does not complete the original base.
     const ready = base.route("GET", "/items/:id", params);
@@ -230,7 +230,7 @@ describe("contract composition", () => {
     expect(() => serverContractHandler(ready, handler)).not.toThrow();
     expect(() => client.contract(ready)).not.toThrow();
     expect(handler).not.toHaveBeenCalled();
-    expect(doRequest).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("defaults to an empty query and no request body", async () => {
@@ -243,7 +243,7 @@ describe("contract composition", () => {
     });
     const fetchEmpty = createClient({
       baseUrl: "https://example.com",
-      doRequest: endpoint.fetch,
+      fetch: endpoint.fetch,
     }).contract(c);
 
     await expect(
@@ -282,7 +282,7 @@ describe("contract composition", () => {
       expectTypeOf(req.query.page).toBeNever();
       return { status: 200, body: { ok: true } };
     });
-    const fetchItem = createClient({ doRequest: endpoint.fetch }).contract(c);
+    const fetchItem = createClient({ fetch: endpoint.fetch }).contract(c);
 
     expectTypeOf(fetchItem).toEqualTypeOf<typeof endpoint.handler>();
     expectTypeOf(fetchItem).toBeCallableWith({

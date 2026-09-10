@@ -41,22 +41,25 @@ export function serverContractHandler<
     };
   }
 
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    const requestExtract = await extractJsonRequest(
+      request,
+      definition.route.path,
+    );
+    const decodedRequest = decodeRequest(requestExtract);
+
+    const response = await handler(decodedRequest);
+
+    const encodedResponse = encodeResponse(response);
+    return createJsonResponse(encodedResponse);
+  };
+
   return {
     method: definition.route.method, // for server router
     path: definition.route.path, // for server router
     handler, // for testing
-    async fetch(req: Request): Promise<Response> {
-      const requestExtract = await extractJsonRequest(
-        req,
-        definition.route.path,
-      );
-      const decodedRequest = decodeRequest(requestExtract);
-
-      const response = await handler(decodedRequest);
-
-      const encodedResponse = encodeResponse(response);
-      return createJsonResponse(encodedResponse);
-    },
+    fetch,
   };
 }
 

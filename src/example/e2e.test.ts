@@ -1,4 +1,4 @@
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { assert, describe, expect, expectTypeOf, it } from "vitest";
 import { createClient } from "../client.js";
 import { exampleContract } from "./contract.js";
 import { exampleHandler } from "./serverHandler.js";
@@ -13,7 +13,8 @@ describe("example end-to-end", () => {
     };
     const fetchExample = createClient({
       baseUrl: "https://example.com",
-      doRequest: async (request) => {
+      fetch: async (request) => {
+        assert(request instanceof Request);
         expect(request.method).toBe("POST");
         expect(request.url).toBe("https://example.com/test/42.5?queryParam=b");
         expect(request.headers.get("content-type")).toBe("application/json");
@@ -46,7 +47,7 @@ describe("example end-to-end", () => {
   it("returns the server's declared business error through the client", async () => {
     const fetchExample = createClient({
       baseUrl: "https://example.com",
-      doRequest: exampleHandler.fetch,
+      fetch: exampleHandler.fetch,
     }).contract(exampleContract);
 
     const response = await fetchExample({

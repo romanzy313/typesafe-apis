@@ -1,4 +1,4 @@
-import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import { assert, describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
@@ -26,14 +26,15 @@ const input = {
 };
 
 function createTransport() {
-  return vi.fn(async (_request: Request) =>
+  return vi.fn<typeof globalThis.fetch>(async () =>
     Response.json({ createdAt: date.toISOString() }, { status: 201 }),
   );
 }
 
 describe("createClient", () => {
   it("encodes requests and decodes the selected response", async () => {
-    const doRequest = vi.fn(async (request: Request) => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async (request) => {
+      assert(request instanceof Request);
       const url = new URL(request.url);
       expect(url.origin).toBe("https://example.com");
       expect(url.pathname).toBe("/api/items/one%2Ftwo%20%3F%23%25");
@@ -49,7 +50,7 @@ describe("createClient", () => {
     });
     const fetchItem = createClient({
       baseUrl: "https://example.com/api/",
-      doRequest,
+      fetch,
     }).contract(itemContract);
 
     const response = await fetchItem({
@@ -58,7 +59,7 @@ describe("createClient", () => {
       body: { at: date },
     });
 
-    expect(doRequest).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
     expect(response).toEqual({ status: 201, body: { createdAt: date } });
   });
 
@@ -66,21 +67,23 @@ describe("createClient", () => {
     ["https://example.com/api", "/items/:id"],
     ["https://example.com/api/", "items/:id"],
   ])("joins base URL %s and path %s", async (baseUrl, path) => {
-    const doRequest = createTransport();
-    const fetchItem = createClient({ baseUrl, doRequest }).contract(
+    const fetch = createTransport();
+    const fetchItem = createClient({ baseUrl, fetch }).contract(
       itemContract.route("POST", path, itemContract.definition.params),
     );
 
     await fetchItem(input);
 
-    expect(doRequest.mock.calls[0]?.[0].url).toBe(
+    const request = fetch.mock.calls[0]?.[0];
+    assert(request instanceof Request);
+    expect(request.url).toBe(
       "https://example.com/api/items/one?limit=0&search=",
     );
   });
 
   it("accepts an absolute contract URL without a base URL", async () => {
-    const doRequest = createTransport();
-    const fetchItem = createClient({ doRequest }).contract(
+    const fetch = createTransport();
+    const fetchItem = createClient({ fetch }).contract(
       itemContract.route(
         "POST",
         "https://example.com/items/:id",
@@ -90,7 +93,9 @@ describe("createClient", () => {
 
     await fetchItem(input);
 
-    expect(doRequest.mock.calls[0]?.[0].url).toBe(
+    const request = fetch.mock.calls[0]?.[0];
+    assert(request instanceof Request);
+    expect(request.url).toBe(
       "https://example.com/items/one?limit=0&search=",
     );
   });
@@ -98,10 +103,10 @@ describe("createClient", () => {
   it.each(["GET", "POST"] as const)(
     "sends a %s request without a body when the codec encodes undefined",
     async (method) => {
-      const doRequest = createTransport();
+      const fetch = createTransport();
       const fetchItem = createClient({
         baseUrl: "https://example.com",
-        doRequest,
+        fetch,
       }).contract({
         definition: {
           ...itemContract.definition,
@@ -113,30 +118,33 @@ describe("createClient", () => {
 
       await fetchItem({ params: input.params, query: {}, body: undefined });
 
-      const request = doRequest.mock.calls[0]?.[0];
-      expect(request?.url).toBe("https://example.com/items/one");
-      expect(request?.method).toBe(method);
-      expect(request?.body).toBeNull();
-      expect(request?.headers.has("content-type")).toBe(false);
+      const request = fetch.mock.calls[0]?.[0];
+      assert(request instanceof Request);
+      expect(request.url).toBe("https://example.com/items/one");
+      expect(request.method).toBe(method);
+      expect(request.body).toBeNull();
+      expect(request.headers.has("content-type")).toBe(false);
     },
   );
 
   it.each([false, 0, "", null])("preserves the JSON body %j", async (body) => {
-    const doRequest = createTransport();
+    const fetch = createTransport();
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest,
+      fetch,
     }).contract(itemContract.request(zodCodec(z.unknown())));
 
     await fetchItem({ ...input, body });
 
-    expect(await doRequest.mock.calls[0]?.[0].json()).toEqual(body);
+    const request = fetch.mock.calls[0]?.[0];
+    assert(request instanceof Request);
+    expect(await request.json()).toEqual(body);
   });
 
   it("decodes declared error responses", async () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () =>
+      fetch: async () =>
         Response.json({ error: "Invalid item" }, { status: 400 }),
     }).contract(itemContract);
 
@@ -149,7 +157,7 @@ describe("createClient", () => {
   it("decodes an absent response body as undefined", async () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () => new Response(null, { status: 204 }),
+      fetch: async () => new Response(null, { status: 204 }),
     }).contract({
       definition: {
         ...itemContract.definition,
@@ -170,10 +178,10 @@ describe("createClient", () => {
   it.each(["id", "toString"])(
     "rejects a missing path parameter %s before calling the transport",
     async (name) => {
-      const doRequest = createTransport();
+      const fetch = createTransport();
       const fetchItem = createClient({
         baseUrl: "https://example.com",
-        doRequest,
+        fetch,
       }).contract(
         itemContract.route("POST", `/items/:${name}`, zodCodec(z.object({}))),
       );
@@ -181,17 +189,17 @@ describe("createClient", () => {
       await expect(fetchItem({ ...input, params: {} })).rejects.toThrow(
         `Missing path parameter ${name}`,
       );
-      expect(doRequest).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
     },
   );
 
   it.each(["params", "query"] as const)(
     "rejects non-string values encoded by the %s codec",
     async (part) => {
-      const doRequest = createTransport();
+      const fetch = createTransport();
       const fetchItem = createClient({
         baseUrl: "https://example.com",
-        doRequest,
+        fetch,
       }).contract({
         definition: {
           ...itemContract.definition,
@@ -205,7 +213,7 @@ describe("createClient", () => {
       await expect(fetchItem(input)).rejects.toThrow(
         `Encoded ${part} must be an object of strings`,
       );
-      expect(doRequest).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
     },
   );
 
@@ -213,10 +221,10 @@ describe("createClient", () => {
     "propagates %s encoding errors before calling the transport",
     async (part) => {
       const error = new Error(`Cannot encode ${part}`);
-      const doRequest = createTransport();
+      const fetch = createTransport();
       const fetchItem = createClient({
         baseUrl: "https://example.com",
-        doRequest,
+        fetch,
       }).contract({
         definition: {
           ...itemContract.definition,
@@ -230,7 +238,7 @@ describe("createClient", () => {
       });
 
       await expect(fetchItem(input)).rejects.toBe(error);
-      expect(doRequest).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
     },
   );
 
@@ -238,7 +246,7 @@ describe("createClient", () => {
     const error = new Error("Connection failed");
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () => {
+      fetch: async () => {
         throw error;
       },
     }).contract(itemContract);
@@ -249,7 +257,7 @@ describe("createClient", () => {
   it.each([500, 599])("rejects undeclared status %s", async (status) => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () => Response.json({ error: "Unexpected" }, { status }),
+      fetch: async () => Response.json({ error: "Unexpected" }, { status }),
     }).contract(itemContract);
 
     await expect(fetchItem(input)).rejects.toThrow(
@@ -260,7 +268,7 @@ describe("createClient", () => {
   it("validates the body with the selected response codec", async () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () =>
+      fetch: async () =>
         Response.json({ createdAt: "invalid" }, { status: 201 }),
     }).contract(itemContract);
 
@@ -270,7 +278,7 @@ describe("createClient", () => {
   it("rejects malformed response JSON", async () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () => new Response("{", { status: 201 }),
+      fetch: async () => new Response("{", { status: 201 }),
     }).contract(itemContract);
 
     await expect(fetchItem(input)).rejects.toBeInstanceOf(SyntaxError);
@@ -280,7 +288,7 @@ describe("createClient", () => {
     const error = new Error("Response body interrupted");
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: async () =>
+      fetch: async () =>
         new Response(
           new ReadableStream({
             start(controller) {
@@ -297,10 +305,14 @@ describe("createClient", () => {
 
 describe("createClient types", () => {
   it("infers decoded arguments and the declared response union", () => {
-    const fetchItem = createClient({ doRequest: createTransport() }).contract(
+    const fetchItem = createClient({ fetch: createTransport() }).contract(
       itemContract,
     );
+    const defaultFetchItem = createClient({
+      baseUrl: "https://example.com",
+    }).contract(itemContract);
 
+    expectTypeOf(defaultFetchItem).toEqualTypeOf<typeof fetchItem>();
     expectTypeOf(fetchItem).parameter(0).toEqualTypeOf<{
       params: { id: string };
       query: { limit: number; search: string };
@@ -337,7 +349,7 @@ describe("createClient types", () => {
   it("narrows decoded response bodies by status", async () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
-      doRequest: createTransport(),
+      fetch: createTransport(),
     }).contract(itemContract);
     const response = await fetchItem(input);
 
@@ -349,7 +361,7 @@ describe("createClient types", () => {
   });
 
   it("rejects contracts with unsupported response statuses", () => {
-    const client = createClient({ doRequest: createTransport() });
+    const client = createClient({ fetch: createTransport() });
     const invalid = {
       definition: {
         ...itemContract.definition,

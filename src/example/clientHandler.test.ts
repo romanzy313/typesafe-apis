@@ -6,14 +6,12 @@ import { exampleHandler } from "./serverHandler.js";
 
 const fetchExample = createClient({
   baseUrl: "https://example.com",
-  doRequest: exampleHandler.fetch,
+  fetch: exampleHandler.fetch,
 }).contract(exampleContract);
 
 describe("example client types", () => {
   it("infers request and response types for the exported client", () => {
-    const exampleFetch = createClient({
-      doRequest: null as any,
-    }).contract(exampleContract);
+    const exampleFetch = createClient().contract(exampleContract);
 
     expectTypeOf<typeof exampleFetch>().toEqualTypeOf<typeof fetchExample>();
     expectTypeOf(fetchExample).parameter(0).toEqualTypeOf<{

@@ -78,6 +78,36 @@ describe("serverContractHandler", () => {
     expect(await response.json()).toBe(date.toISOString());
   });
 
+  it.each([
+    ["URL string", "https://example.com/items/42?filter=a"],
+    ["URL object", new URL("https://example.com/items/42?filter=a")],
+    ["Request", createRequest()],
+  ] as const)("accepts a %s and applies request options", async (_name, input) => {
+    const c = createContract();
+    const endpoint = serverContractHandler(c, async () => ({
+      status: 200,
+      body: date,
+    }));
+
+    const response = await endpoint.fetch(input, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: false }),
+    });
+
+    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
+      id: "42",
+    });
+    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({
+      filter: "a",
+    });
+    expect(c.definition.request.decode).toHaveBeenCalledExactlyOnceWith({
+      enabled: false,
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toBe(date.toISOString());
+  });
+
   it("uses the error response codec for status 400", async () => {
     const c = createContract();
     const body = { error: "Invalid item" };
@@ -189,7 +219,7 @@ describe("serverContractHandler", () => {
       handler,
     );
 
-    await endpoint.fetch(new Request("https://example.com/items"));
+    await endpoint.fetch("https://example.com/items");
 
     expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({});
@@ -358,9 +388,7 @@ describe("serverContractHandler types", () => {
     expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
-    expectTypeOf(endpoint.fetch).toEqualTypeOf<
-      (request: Request) => Promise<Response>
-    >();
+    expectTypeOf(endpoint.fetch).toEqualTypeOf<typeof globalThis.fetch>();
   });
 
   it("narrows the response body by status", async () => {

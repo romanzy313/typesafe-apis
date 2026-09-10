@@ -11,8 +11,7 @@ import type {
 export type ClientOptions = {
   // Prefix for endpoint paths; omit for browser-relative or absolute URLs.
   baseUrl?: string;
-  // minimal fetch here
-  doRequest: (request: Request) => Promise<Response>;
+  fetch?: typeof globalThis.fetch;
 };
 
 export type TypesafeFetch<
@@ -30,9 +29,9 @@ export type Client = {
   ): TypesafeFetch<TParams, TQuery, TRequestBody, TResponses>;
 };
 
-export function createClient(opts: ClientOptions): Client {
+export function createClient(opts: ClientOptions = {}): Client {
   const baseUrl = opts.baseUrl ?? "";
-  const doRequest = opts.doRequest;
+  const fetch = opts.fetch ?? globalThis.fetch;
 
   return {
     contract<TParams, TQuery, TRequestBody, TResponses extends ResponseCodecs>(
@@ -90,7 +89,7 @@ export function createClient(opts: ClientOptions): Client {
           definition.route.path,
         );
 
-        const response = await doRequest(request);
+        const response = await fetch(request);
         const responseExtract = await extractJsonResponse(response);
 
         return decodeResponse(responseExtract);
