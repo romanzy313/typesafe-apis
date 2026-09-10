@@ -5,7 +5,7 @@ import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
 import { createMiddleware, type MiddlewareHandler } from "./middleware.js";
 import { contractHandler, serverEndpoint } from "./server.js";
-import type { TypedRequest } from "./types.js";
+import type { RequestContext, TypedRequest } from "./types.js";
 
 const stringToNumber = z.codec(z.string(), z.number(), {
   decode: Number,
@@ -73,8 +73,10 @@ describe("createMiddleware", () => {
         TypedRequest<{ id: number }, { fail: boolean }, { name: string }>
       >();
       expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
-      expectTypeOf(context).toEqualTypeOf<TraceContext>();
-      expectTypeOf(next).parameter(0).toEqualTypeOf<AuthContext>();
+      expectTypeOf(context).toEqualTypeOf<RequestContext & TraceContext>();
+      expectTypeOf(next).parameter(0).toEqualTypeOf<
+        AuthContext & Partial<RequestContext>
+      >();
       return next({ user: { name: server.userName } });
     });
 
@@ -100,7 +102,7 @@ describe("createMiddleware", () => {
           TypedRequest<unknown, unknown, unknown>
         >();
         expectTypeOf(server).toEqualTypeOf<Readonly<{}>>();
-        expectTypeOf(context).toEqualTypeOf<{}>();
+        expectTypeOf(context).toEqualTypeOf<RequestContext>();
         return next({});
       },
     );
@@ -171,6 +173,86 @@ describe("createMiddleware", () => {
 
 describe("middleware composition", () => {
   it.each([false, true])(
+    "writes middleware response headers with fail=%s",
+    async (fail) => {
+      const bound = tracedEndpoint()
+        .use(async (req, _server, context, next) => {
+          expectTypeOf(req.headers).toEqualTypeOf<Readonly<Headers>>();
+          expectTypeOf(context.headers).toEqualTypeOf<Headers>();
+          context.headers.set("x-trace-id", req.headers.get("x-trace-id")!);
+          const response = await next({});
+          context.headers.set("x-status", String(response.status));
+          return response;
+        })
+        .use(authenticate)
+        .handler(async (_req, _server, context) => {
+          context.headers.set("x-user", context.user.name);
+          return { status: 200, body: { hello: context.user.name } };
+        });
+      const request = createRequest(7, fail);
+      request.headers.set("x-trace-id", "client-trace");
+      request.headers.set("authorization", "Bearer example-token");
+
+      const response = await bound.fetchWithContext(request, serverContext);
+
+      expect(response.status).toBe(fail ? 403 : 200);
+      expect(response.headers.get("content-type")).toBe("application/json");
+      expect(response.headers.get("x-trace-id")).toBe("client-trace");
+      expect(response.headers.get("x-status")).toBe(fail ? "403" : "200");
+      expect(response.headers.get("x-user")).toBe(fail ? null : "Ada");
+      expect(response.headers.has("authorization")).toBe(false);
+      expect(await response.json()).toEqual(
+        fail ? { error: "auth_please" } : { hello: "Ada" },
+      );
+    },
+  );
+
+  it.each([false, true])(
+    "preserves replaced headers when downstream throws=%s",
+    async (throws) => {
+      const error = new Error("Handler failed");
+      const replacement = new Headers({ "x-inner": "set" });
+      const requestContext: RequestContext = { headers: new Headers() };
+      const bound = serverEndpoint<ServerContext>()
+        .contract(testContract)
+        .use(async (_req, _server, context, next) => {
+          try {
+            return await next({ headers: replacement });
+          } catch (caught) {
+            expect(caught).toBe(error);
+            return { status: 403, body: { error: "auth_please" } };
+          } finally {
+            context.headers.set("x-outer", "set");
+          }
+        })
+        .handler(async (_req, _server, context) => {
+          context.headers.set("x-handler", "set");
+          if (throws) throw error;
+          return { status: 200, body: { hello: "world" } };
+        });
+
+      const response = await bound.handle(
+        {
+          params: { id: 7 },
+          query: { fail: false },
+          body: { name: "world" },
+          headers: new Headers(),
+        },
+        serverContext,
+        requestContext,
+      );
+
+      expect(response.status).toBe(throws ? 403 : 200);
+      expect(requestContext.headers).toBe(replacement);
+      expect([...requestContext.headers]).toEqual([
+        ["x-handler", "set"],
+        ["x-inner", "set"],
+        ["x-outer", "set"],
+      ]);
+    },
+  );
+
+  it.each([false, true])(
     "runs middleware for typed requests with fail=%s",
     async (fail) => {
       const handlerCalled = vi.fn();
@@ -194,6 +276,7 @@ describe("middleware composition", () => {
             params: { id: 7 },
             query: { fail },
             body: { name: "world" },
+            headers: new Headers(),
           },
           serverContext,
         ),
@@ -211,12 +294,13 @@ describe("middleware composition", () => {
     const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       .use<TraceContext>(async (req, server, context, next) => {
-        expect(context).toEqual({});
+        expect(context).toEqual({ headers: new Headers() });
         expect(server).toBe(serverContext);
         expect(req).toEqual({
           params: { id: 7 },
           query: { fail: false },
           body: { name: "world" },
+          headers: new Headers({ "content-type": "application/json" }),
         });
         order.push("trace before");
         const response = await next({ traceId: `request-${req.params.id}` });
@@ -228,6 +312,7 @@ describe("middleware composition", () => {
         expect(context).toEqual({
           traceId: "request-7",
           user: { name: "Ada" },
+          headers: new Headers(),
         });
         order.push("inner before");
         const response = await next({});
@@ -258,6 +343,7 @@ describe("middleware composition", () => {
         params: { id: 7 },
         query: { fail: false },
         body: { name: "world" },
+        headers: new Headers(),
       }),
     ).resolves.toEqual({ status: 200, body: { hello: "Hello Ada, world" } });
     expect(bound.definition).toBe(testContract.definition);
@@ -380,13 +466,14 @@ describe("middleware composition", () => {
     expect(await updated.json()).toEqual({ hello: "42" });
   });
 
-  it("starts concurrent requests with separate empty contexts", async () => {
-    const contexts: object[] = [];
+  it("starts concurrent requests with separate contexts and headers", async () => {
+    const contexts: RequestContext[] = [];
     const bound = serverEndpoint<ServerContext>()
       .contract(testContract)
       .use<{ requestId: number }>(async (req, server, context, next) => {
-        expect(context).toEqual({});
+        expect(context).toEqual({ headers: new Headers() });
         expect(server).toBe(serverContext);
+        context.headers.set("x-request-id", String(req.params.id));
         contexts.push(context);
         await Promise.resolve();
         return next({ requestId: req.params.id });
@@ -407,6 +494,7 @@ describe("middleware composition", () => {
           params: { id: 3 },
           query: { fail: false },
           body: { name: "world" },
+          headers: new Headers(),
         },
         serverContext,
       ),
@@ -414,6 +502,9 @@ describe("middleware composition", () => {
 
     expect(contexts).toHaveLength(3);
     expect(new Set(contexts).size).toBe(3);
+    expect(new Set(contexts.map((context) => context.headers)).size).toBe(3);
+    expect(first.headers.get("x-request-id")).toBe("1");
+    expect(second.headers.get("x-request-id")).toBe("2");
     expect(await first.json()).toEqual({ hello: "Hello:1" });
     expect(await second.json()).toEqual({ hello: "Hello:2" });
     expect(third).toEqual({ status: 200, body: { hello: "Hello:3" } });
@@ -424,8 +515,8 @@ describe("middleware composition", () => {
     const bound = contractHandler(
       testContract,
       async (req, server: Readonly<ServerContext>, context) => {
-        expectTypeOf(context).toEqualTypeOf<{}>();
-        expect(context).toEqual({});
+        expectTypeOf(context).toEqualTypeOf<RequestContext>();
+        expect(context).toEqual({ headers: new Headers() });
         return {
           status: 200,
           body: { hello: `${server.greeting} ${req.body.name}` },
@@ -484,6 +575,7 @@ describe("middleware composition", () => {
             params: { id: 7 },
             query: { fail: false },
             body: { name: "world" },
+            headers: new Headers(),
           },
           serverContext,
         ),
@@ -546,7 +638,7 @@ describe("middleware types", () => {
       .contract(testContract)
       .use<AuthContext>(async (_req, server, context, next) => {
         expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
-        expectTypeOf(context).toEqualTypeOf<{}>();
+        expectTypeOf(context).toEqualTypeOf<RequestContext>();
         // @ts-expect-error Middleware cannot reassign server context fields.
         server.userName = "changed";
         // @ts-expect-error Authentication has not added a user yet.
@@ -555,6 +647,8 @@ describe("middleware types", () => {
         next({});
         // @ts-expect-error The user name must be a string.
         next({ user: { name: 42 } });
+        // @ts-expect-error Replacing context headers requires Headers.
+        next({ user: { name: "Ada" }, headers: "invalid" });
         return next({ user: { name: server.userName } });
       })
       .handler(async (_req, server, context) => {
@@ -575,8 +669,16 @@ describe("middleware types", () => {
       params: { id: 7 },
       query: { fail: false },
       body: { name: "world" },
+      headers: new Headers(),
     };
     expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext);
+    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext, {
+      headers: new Headers(),
+    });
+    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext, {
+      // @ts-expect-error The base context requires a Headers instance.
+      headers: { "x-test": "value" },
+    });
     // @ts-expect-error The server context is required for typed requests too.
     expectTypeOf(bound.handle).toBeCallableWith(typedRequest);
     // @ts-expect-error The server context must supply both configured fields.
@@ -584,7 +686,7 @@ describe("middleware types", () => {
     expectTypeOf(bound.handle).toBeCallableWith(
       typedRequest,
       serverContext,
-      // @ts-expect-error The request context is created internally.
+      // @ts-expect-error A supplied base context must include headers.
       { user: { name: "injected" } },
     );
     const request = createRequest();
@@ -677,7 +779,7 @@ describe("middleware types", () => {
     ) => ({ status: 200 as const, body: { hello: "world" } });
     // @ts-expect-error The accumulated user name is a string.
     builder.handler(wrongContextHandler);
-    // @ts-expect-error Direct binding starts with an empty request context.
+    // @ts-expect-error Direct binding supplies headers, not an authenticated user.
     contractHandler(testContract, wrongContextHandler);
   });
 });

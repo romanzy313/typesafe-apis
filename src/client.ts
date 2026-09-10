@@ -60,6 +60,7 @@ export function createClient(opts: ClientOptions = {}): Client {
           params,
           query,
           body: definition.request.encode(req.body),
+          headers: req.headers,
         };
       }
       function decodeResponse(
@@ -150,10 +151,14 @@ function createJsonRequest(
     requestExtract.body === undefined
       ? null
       : JSON.stringify(requestExtract.body);
+  const headers = new Headers(requestExtract.headers);
+  if (body !== null && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
 
   return new Request(query ? `${url}?${query}` : url, {
     method,
-    headers: body === null ? {} : { "content-type": "application/json" },
+    headers,
     body,
   });
 }
@@ -162,5 +167,5 @@ async function extractJsonResponse(response: Response) {
   const body: unknown =
     response.body === null ? undefined : await response.json();
 
-  return { status: response.status, body };
+  return { status: response.status, body, headers: response.headers };
 }

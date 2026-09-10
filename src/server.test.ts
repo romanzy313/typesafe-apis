@@ -2,8 +2,8 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
 import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
-import { serverEndpoint, type ServerEndpoint } from "./server.js";
-import type { StatusCode, TypedRequest } from "./types.js";
+import { contractHandler, serverEndpoint, type ServerEndpoint } from "./server.js";
+import type { RequestContext, StatusCode, TypedRequest } from "./types.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 
@@ -44,6 +44,41 @@ function createRequest(url = "https://example.com/items/42?filter=a") {
 }
 
 describe("serverEndpoint", () => {
+  it("handles typed requests with a supplied base context", async () => {
+    const incoming = new Headers({ "x-client": "example" });
+    const requestContext: RequestContext = {
+      headers: new Headers({ "x-base": "seed" }),
+    };
+    const endpoint = contractHandler(
+      createContract(),
+      async (req, _server: Readonly<{}>, context) => {
+        expectTypeOf(context).toEqualTypeOf<RequestContext>();
+        expect(context).toBe(requestContext);
+        expect(req.headers).toBe(incoming);
+        context.headers.set("x-client-seen", req.headers.get("x-client")!);
+        return { status: 200, body: date };
+      },
+    );
+
+    const response = await endpoint.handle(
+      {
+        params: { id: 7 },
+        query: { filter: "b" },
+        body: { enabled: true },
+        headers: incoming,
+      },
+      {},
+      requestContext,
+    );
+
+    expect(response).toEqual({ status: 200, body: date });
+    expect([...requestContext.headers]).toEqual([
+      ["x-base", "seed"],
+      ["x-client-seen", "example"],
+    ]);
+    expect([...incoming]).toEqual([["x-client", "example"]]);
+  });
+
   it("handles decoded values without running transport codecs", async () => {
     const c = createContract();
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
@@ -52,11 +87,14 @@ describe("serverEndpoint", () => {
       params: { id: 7 },
       query: { filter: "b" },
       body: { enabled: false },
+      headers: new Headers(),
     };
 
     const response = await endpoint.handle(request, {});
 
-    expect(handler).toHaveBeenCalledExactlyOnceWith(request, {}, {});
+    expect(handler).toHaveBeenCalledExactlyOnceWith(request, {}, {
+      headers: new Headers(),
+    });
     expect(response).toEqual({ status: 200, body: date });
     expect(response.body).toBe(date);
     expect(c.definition.params.decode).not.toHaveBeenCalled();
@@ -93,9 +131,10 @@ describe("serverEndpoint", () => {
         params: { id: 42 },
         query: { filter: "a" },
         body: { enabled: true },
+        headers: new Headers({ "content-type": "application/json" }),
       },
       {},
-      {},
+      { headers: new Headers() },
     );
     expect(c.definition.responses[200].encode).toHaveBeenCalledExactlyOnceWith(
       date,
@@ -236,9 +275,10 @@ describe("serverEndpoint", () => {
         params: { id: 42 },
         query: { filter: "a" },
         body: undefined,
+        headers: new Headers(),
       },
       {},
-      {},
+      { headers: new Headers() },
     );
   });
 
@@ -439,6 +479,7 @@ describe("serverEndpoint types", () => {
     expectTypeOf(endpoint.handle).parameters.toEqualTypeOf<[
       TypedRequest<{ id: number }, { filter: "a" | "b" }, { enabled: boolean }>,
       Readonly<{}>,
+      (RequestContext | undefined)?,
     ]>();
     expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
@@ -447,6 +488,7 @@ describe("serverEndpoint types", () => {
       params: { id: 42 },
       query: { filter: "a" },
       body: { enabled: true },
+      headers: new Headers(),
     };
     expectTypeOf(endpoint.handle).toBeCallableWith(typedRequest, {});
     expectTypeOf(endpoint.handle).toBeCallableWith(
@@ -490,6 +532,7 @@ describe("serverEndpoint types", () => {
         params: { id: 42 },
         query: { filter: "a" },
         body: { enabled: true },
+        headers: new Headers(),
       },
       {},
     );

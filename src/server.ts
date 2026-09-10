@@ -8,6 +8,7 @@ import type {
   Codec,
   Contract,
   ContractResponse,
+  RequestContext,
   RequestExtract,
   ResponseCodecs,
   ResponseExtract,
@@ -31,6 +32,7 @@ export type ServerEndpoint<
   handle(
     request: TypedRequest<TParams, TQuery, TRequestBody>,
     serverContext: Readonly<TServerContext>,
+    requestContext?: RequestContext,
   ): Promise<ContractResponse<NoInfer<TResponses>>>;
   fetchWithContext(
     request: Request,
@@ -48,7 +50,7 @@ export type EndpointHandler<
 > = (
   req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
   serverContext: Readonly<TServerContext>,
-  requestContext: TRequestContext,
+  requestContext: RequestContext & TRequestContext,
 ) => Promise<ContractResponse<NoInfer<TResponses>>>;
 
 export class ServerEndpointBuilder<
@@ -134,7 +136,7 @@ export function serverEndpoint<TServerContext = {}>() {
   };
 }
 
-/** Bind a composed handler; every request starts with its own empty context. */
+/** Bind a composed handler; omitted context gets fresh response headers. */
 export function contractHandler<
   TParams,
   TQuery,
@@ -167,6 +169,7 @@ export function contractHandler<
       params: definition.params.decode(req.params),
       query: definition.query.decode(req.query),
       body: definition.request.decode(req.body),
+      headers: req.headers,
     };
   }
   function encodeResponse(res: ResponseExtract) {
@@ -176,14 +179,16 @@ export function contractHandler<
     return {
       status: res.status,
       body: codec.encode(res.body),
+      headers: res.headers,
     };
   }
 
   async function handle(
     request: TypedRequest<TParams, TQuery, TRequestBody>,
     serverContext: Readonly<TServerContext>,
+    requestContext: RequestContext = { headers: new Headers() },
   ): Promise<ContractResponse<NoInfer<TResponses>>> {
-    return handler(request, serverContext, {});
+    return handler(request, serverContext, requestContext);
   }
 
   async function fetchWithContext(
@@ -195,8 +200,12 @@ export function contractHandler<
       definition.route.path,
     );
     const decodedRequest = decodeRequest(requestExtract);
-    const response = await handle(decodedRequest, serverContext);
-    const encodedResponse = encodeResponse(response);
+    const requestContext: RequestContext = { headers: new Headers() };
+    const response = await handle(decodedRequest, serverContext, requestContext);
+    const encodedResponse = encodeResponse({
+      ...response,
+      headers: requestContext.headers,
+    });
     return createJsonResponse(encodedResponse);
   }
 
@@ -233,11 +242,13 @@ async function extractJsonRequest(
     params,
     query: Object.fromEntries(url.searchParams),
     body: req.body === null ? undefined : await req.json(),
+    headers: req.headers,
   };
 }
 
 function createJsonResponse(responseExtract: ResponseExtract): Response {
   return Response.json(responseExtract.body, {
     status: responseExtract.status,
+    headers: responseExtract.headers,
   });
 }

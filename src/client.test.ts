@@ -24,6 +24,7 @@ const input = {
   params: { id: "one" },
   query: { limit: 0, search: "" },
   body: { at: date },
+  headers: new Headers(),
 };
 
 function createTransport() {
@@ -34,6 +35,7 @@ function createTransport() {
 
 describe("createClient", () => {
   it("encodes requests and decodes the selected response", async () => {
+    const headers = new Headers({ authorization: "Bearer example-token" });
     const fetch = vi.fn<MinFetch>(async (request) => {
       assert(request instanceof Request);
       const url = new URL(request.url);
@@ -46,6 +48,7 @@ describe("createClient", () => {
       expect(url.hash).toBe("");
       expect(request.method).toBe("POST");
       expect(request.headers.get("content-type")).toBe("application/json");
+      expect(request.headers.get("authorization")).toBe("Bearer example-token");
       expect(await request.json()).toEqual({ at: date.toISOString() });
       return Response.json({ createdAt: date.toISOString() }, { status: 201 });
     });
@@ -58,10 +61,12 @@ describe("createClient", () => {
       params: { id: "one/two ?#%" },
       query: { limit: 0, search: "a & b+c/?#" },
       body: { at: date },
+      headers,
     });
 
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(response).toEqual({ status: 201, body: { createdAt: date } });
+    expect([...headers]).toEqual([["authorization", "Bearer example-token"]]);
   });
 
   it.each([
@@ -117,7 +122,12 @@ describe("createClient", () => {
         },
       });
 
-      await fetchItem({ params: input.params, query: {}, body: undefined });
+      await fetchItem({
+        params: input.params,
+        query: {},
+        body: undefined,
+        headers: new Headers({ "x-client": "example" }),
+      });
 
       const request = fetch.mock.calls[0]?.[0];
       assert(request instanceof Request);
@@ -125,6 +135,7 @@ describe("createClient", () => {
       expect(request.method).toBe(method);
       expect(request.body).toBeNull();
       expect(request.headers.has("content-type")).toBe(false);
+      expect(request.headers.get("x-client")).toBe("example");
     },
   );
 
@@ -153,6 +164,25 @@ describe("createClient", () => {
       status: 400,
       body: { error: "Invalid item" },
     });
+  });
+
+  it("preserves an explicitly supplied JSON content type", async () => {
+    const fetch = createTransport();
+    const headers = new Headers({
+      "content-type": "application/json; charset=utf-8",
+    });
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      fetch,
+    }).contract(itemContract);
+
+    await fetchItem({ ...input, headers });
+
+    const request = fetch.mock.calls[0]?.[0];
+    assert(request instanceof Request);
+    expect(request.headers.get("content-type")).toBe(
+      "application/json; charset=utf-8",
+    );
   });
 
   it("decodes an absent response body as undefined", async () => {
@@ -318,12 +348,18 @@ describe("createClient types", () => {
       params: { id: string };
       query: { limit: number; search: string };
       body: { at: Date };
+      headers: Readonly<Headers>;
     }>();
     expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
       | { status: 201; body: { createdAt: Date } }
       | { status: 400; body: { error: string } }
     >();
     expectTypeOf(fetchItem).toBeCallableWith(input);
+    expectTypeOf(fetchItem).toBeCallableWith({
+      ...input,
+      // @ts-expect-error Request headers must be a Headers instance.
+      headers: { authorization: "Bearer example-token" },
+    });
 
     expectTypeOf(fetchItem).toBeCallableWith({
       ...input,
@@ -344,6 +380,7 @@ describe("createClient types", () => {
     expectTypeOf(fetchItem).toBeCallableWith({
       params: input.params,
       query: input.query,
+      headers: input.headers,
     });
   });
 

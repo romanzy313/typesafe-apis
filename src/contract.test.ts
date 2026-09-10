@@ -178,6 +178,7 @@ describe("contract composition", () => {
         params: { id: 42.5 },
         query: { page: 2, action },
         body: undefined,
+        headers: new Headers(),
       });
       if (action === "read") {
         expect(response).toEqual({ status: 200, body: { id: 42.5, page: 2 } });
@@ -206,6 +207,7 @@ describe("contract composition", () => {
       // @ts-expect-error The inherited page field is required.
       query: { action: "read" },
       body: undefined,
+      headers: new Headers(),
     });
     // @ts-expect-error The disabled variant requires data.
     serverEndpoint().contract(final).handler(async () => ({
@@ -272,7 +274,12 @@ describe("contract composition", () => {
       .response(200, zodCodec(z.object({ ok: z.boolean() })));
     const builder = serverEndpoint().contract(c);
     const endpoint = builder.handler(async (req) => {
-      expect(req).toEqual({ params: {}, query: {}, body: undefined });
+      expect(req).toEqual({
+        params: {},
+        query: {},
+        body: undefined,
+        headers: new Headers(),
+      });
       return { status: 200, body: { ok: true } };
     });
     const fetchEmpty = createClient({
@@ -281,7 +288,12 @@ describe("contract composition", () => {
     }).contract(c);
 
     await expect(
-      fetchEmpty({ params: {}, query: {}, body: undefined }),
+      fetchEmpty({
+        params: {},
+        query: {},
+        body: undefined,
+        headers: new Headers(),
+      }),
     ).resolves.toEqual({
       status: 200,
       body: { ok: true },
@@ -290,12 +302,14 @@ describe("contract composition", () => {
       params: Record<string, never>;
       query: Record<string, never>;
       body: undefined;
+      headers: Readonly<Headers>;
     }>();
     expectTypeOf(fetchEmpty).toBeCallableWith({
       params: {},
       // @ts-expect-error An undeclared query cannot contain fields.
       query: { page: 1 },
       body: undefined,
+      headers: new Headers(),
     });
   });
 
@@ -331,6 +345,7 @@ describe("contract composition", () => {
       // @ts-expect-error The conflicting page field must not disappear.
       query: { filter: "active" },
       body: undefined,
+      headers: new Headers(),
     });
 
     for (const page of ["2", 2]) {
@@ -391,11 +406,13 @@ describe("contract merge", () => {
             params: { id: number };
             query: { page: number };
             body: { name: string };
+            headers: Readonly<Headers>;
           }>();
           expect(req).toEqual({
             params: { id: 7 },
             query: { page: 2 },
             body: { name: "item" },
+            headers: new Headers({ "content-type": "application/json" }),
           });
           return { status: 201, body: { created: true } };
         });
@@ -417,6 +434,7 @@ describe("contract merge", () => {
           params: { id: 7 },
           query: { page: 2 },
           body: { name: "item" },
+          headers: new Headers(),
         }),
       ).resolves.toEqual({ status: 201, body: { created: true } });
     }

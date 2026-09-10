@@ -2,10 +2,11 @@ import type { EndpointHandler } from "./server.js";
 import type {
   Codec,
   ContractResponse,
+  RequestContext,
   ResponseCodecs,
-  ResponseExtract,
   StatusCode,
   TypedRequest,
+  TypedResponse,
 } from "./types.js";
 
 declare const middlewareResponses: unique symbol;
@@ -20,11 +21,13 @@ export type MiddlewareHandler<
   TRequestContext extends object,
   TRequestContextNext extends object,
 > = {
-  <TNextResponse extends ResponseExtract>(
+  <TNextResponse extends TypedResponse<StatusCode, unknown>>(
     req: TypedRequest<TParams, TQuery, TRequestBody>,
     serverContext: Readonly<TServerContext>,
-    requestContext: TRequestContext,
-    next: (context: TRequestContextNext) => Promise<TNextResponse>,
+    requestContext: RequestContext & TRequestContext,
+    next: (
+      context: TRequestContextNext & Partial<RequestContext>,
+    ) => Promise<TNextResponse>,
   ): Promise<ContractResponse<NoInfer<TResponses>> | TNextResponse>;
   // Keep response requirements when generic continuation types are compared.
   readonly [middlewareResponses]?: ContractResponse<TResponses>;
@@ -160,11 +163,18 @@ export function composeMiddleware<
         req,
         serverContext,
         requestContext,
-        (addedContext) =>
-          handler(req, serverContext, {
+        async (addedContext) => {
+          const nextContext = {
             ...requestContext,
             ...addedContext,
-          }),
+          };
+          try {
+            return await handler(req, serverContext, nextContext);
+          } finally {
+            // Propagate a replaced collection to outer middleware and callers.
+            requestContext.headers = nextContext.headers;
+          }
+        },
       );
       if (response === undefined) {
         throw new Error("Middleware returned undefined");

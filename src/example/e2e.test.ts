@@ -19,6 +19,7 @@ describe("example end-to-end", () => {
       params: { pathParam: 42 },
       query: { queryParam: "a" },
       body: { requestParam: true },
+      headers: new Headers(),
     });
 
     expect(response).toEqual({
@@ -63,6 +64,7 @@ describe("example end-to-end", () => {
       params: { pathParam: 42.5 },
       query: { queryParam: "b" },
       body: { requestParam: true },
+      headers: new Headers(),
     });
 
     expect(response).toEqual({ status: 200, body: expectedBody });
@@ -82,6 +84,7 @@ describe("example end-to-end", () => {
       params: { pathParam: 42 },
       query: { queryParam: "a" },
       body: { requestParam: false },
+      headers: new Headers(),
     });
 
     expect(response).toEqual({

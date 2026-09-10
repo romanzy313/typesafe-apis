@@ -40,6 +40,7 @@ describe("example", () => {
         params: { pathParam: 42 },
         query: { queryParam: "b" },
         body: { requestParam: false },
+        headers: new Headers(),
       },
       {},
     );
@@ -119,6 +120,7 @@ describe("example types", () => {
       params: { pathParam: number };
       query: { queryParam: "a" | "b" };
       body: { requestParam: boolean };
+      headers: Readonly<Headers>;
     }>();
     expectTypeOf(exampleHandler.handle).returns.resolves.toEqualTypeOf<
       | {

@@ -123,17 +123,25 @@ export type RequestExtract = {
   params: Record<string, string>;
   query: Record<string, string>;
   body: unknown;
+  headers: Readonly<Headers>;
 };
 
 export type TypedRequest<TParams, TQuery, TRequestBody> = {
   params: TParams;
   query: TQuery;
   body: TRequestBody;
+  headers: Readonly<Headers>;
+};
+
+/** Mutable response headers shared by middleware and the handler. */
+export type RequestContext = {
+  headers: Headers;
 };
 
 export type ResponseExtract = {
   status: StatusCode;
   body: unknown;
+  headers: Headers;
 };
 
 export type TypedResponse<TStatus extends StatusCode, TResponseBody> = {

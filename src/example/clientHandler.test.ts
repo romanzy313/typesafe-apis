@@ -18,6 +18,7 @@ describe("example client types", () => {
       params: { pathParam: number };
       query: { queryParam: "a" | "b" };
       body: { requestParam: boolean };
+      headers: Readonly<Headers>;
     }>();
     expectTypeOf(fetchExample).returns.resolves.toEqualTypeOf<
       | {
@@ -39,6 +40,7 @@ describe("example client types", () => {
       params: { pathParam: 42 },
       query: { queryParam: "a" as const },
       body: { requestParam: true },
+      headers: new Headers(),
     };
 
     expectTypeOf(fetchExample).toBeCallableWith({
