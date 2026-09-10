@@ -9,24 +9,24 @@ const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   encode: (num) => num.toString(),
 });
 
-export const exampleContract = contract({
-  method: "POST",
-  path: "/test/:pathParam",
-  params: zodCodec(
-    z.object({
-      pathParam: stringToNumber,
-    }),
-  ),
-  query: zodCodec(
-    z.object({ queryParam: z.union([z.literal("a"), z.literal("b")]) }),
-  ),
-  request: zodCodec(
-    z.object({
-      requestParam: z.boolean(),
-    }),
-  ),
-  responses: {
-    200: zodCodec(
+const base = contract()
+  .query(
+    zodCodec(
+      z.object({ queryParam: z.union([z.literal("a"), z.literal("b")]) }),
+    ),
+  )
+  .response(400, zodCodec(z.object({ error: z.string() })));
+
+export const exampleContract = base
+  .route(
+    "POST",
+    "/test/:pathParam",
+    zodCodec(z.object({ pathParam: stringToNumber })),
+  )
+  .request(zodCodec(z.object({ requestParam: z.boolean() })))
+  .response(
+    200,
+    zodCodec(
       z.object({
         hi: z.string(),
         pathParam: z.number(),
@@ -34,6 +34,4 @@ export const exampleContract = contract({
         requestParam: z.boolean(),
       }),
     ),
-    400: zodCodec(z.object({ error: z.string() })),
-  },
-});
+  );

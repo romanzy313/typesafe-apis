@@ -1,39 +1,38 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import z from "zod";
 import { serverContractHandler } from "./server.js";
-import { type Codec, type StatusCode, type TypedRequest } from "./types.js";
+import { type StatusCode, type TypedRequest } from "./types.js";
 import { contract } from "./contract.js";
+import { zodCodec } from "./codec.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 
 function createContract() {
-  return contract({
-    method: "POST",
-    path: "/items/:id",
-    params: {
-      encode: (value: { id: number }) => ({ id: String(value.id) }),
-      decode: vi.fn((_value: unknown) => ({ id: 42 })),
-    },
-    query: {
-      encode: (value: { filter: "a" | "b" }) => value,
-      decode: vi.fn((_value: unknown): { filter: "a" | "b" } => ({
-        filter: "a",
-      })),
-    },
-    request: {
-      encode: (value: { enabled: boolean }) => value,
-      decode: vi.fn((_value: unknown) => ({ enabled: true })),
-    },
-    responses: {
-      200: {
-        encode: vi.fn((value: Date) => value.toISOString()),
-        decode: vi.fn((_value: unknown) => date),
-      },
-      400: {
-        encode: vi.fn((value: { error: string }) => value),
-        decode: vi.fn((_value: unknown) => ({ error: "Invalid item" })),
-      },
-    },
+  const stringToNumber = z.codec(z.string(), z.number(), {
+    decode: Number,
+    encode: String,
   });
+  const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
+    decode: (value) => new Date(value),
+    encode: (value) => value.toISOString(),
+  });
+  const c = contract()
+    .route("POST", "/items/:id", zodCodec(z.object({ id: stringToNumber })))
+    .query(zodCodec(z.object({ filter: z.enum(["a", "b"]) })))
+    .request(zodCodec(z.object({ enabled: z.boolean() })))
+    .response(200, zodCodec(isoDatetimeToDate))
+    .response(400, zodCodec(z.object({ error: z.string() })));
+
+  vi.spyOn(c.definition.params, "decode").mockReturnValue({ id: 42 });
+  vi.spyOn(c.definition.query, "decode").mockReturnValue({ filter: "a" });
+  vi.spyOn(c.definition.request, "decode").mockReturnValue({ enabled: true });
+  vi.spyOn(c.definition.responses[200], "encode");
+  vi.spyOn(c.definition.responses[200], "decode").mockReturnValue(date);
+  vi.spyOn(c.definition.responses[400], "encode");
+  vi.spyOn(c.definition.responses[400], "decode").mockReturnValue({
+    error: "Invalid item",
+  });
+  return c;
 }
 
 function createRequest(url = "https://example.com/items/42?filter=a") {
@@ -55,17 +54,25 @@ describe("serverContractHandler", () => {
     expect(endpoint.method).toBe("POST");
     expect(endpoint.path).toBe("/items/:id");
     expect(endpoint.handler).toBe(handler);
-    expect(c.params.decode).toHaveBeenCalledExactlyOnceWith({ id: "42" });
-    expect(c.query.decode).toHaveBeenCalledExactlyOnceWith({ filter: "a" });
-    expect(c.request.decode).toHaveBeenCalledExactlyOnceWith({ enabled: true });
+    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
+      id: "42",
+    });
+    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({
+      filter: "a",
+    });
+    expect(c.definition.request.decode).toHaveBeenCalledExactlyOnceWith({
+      enabled: true,
+    });
     expect(handler).toHaveBeenCalledExactlyOnceWith({
       params: { id: 42 },
       query: { filter: "a" },
       body: { enabled: true },
     });
-    expect(c.responses[200].encode).toHaveBeenCalledExactlyOnceWith(date);
-    expect(c.responses[200].decode).not.toHaveBeenCalled();
-    expect(c.responses[400].encode).not.toHaveBeenCalled();
+    expect(c.definition.responses[200].encode).toHaveBeenCalledExactlyOnceWith(
+      date,
+    );
+    expect(c.definition.responses[200].decode).not.toHaveBeenCalled();
+    expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("application/json");
     expect(await response.json()).toBe(date.toISOString());
@@ -83,16 +90,20 @@ describe("serverContractHandler", () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual(body);
-    expect(c.responses[400].encode).toHaveBeenCalledExactlyOnceWith(body);
-    expect(c.responses[200].encode).not.toHaveBeenCalled();
+    expect(c.definition.responses[400].encode).toHaveBeenCalledExactlyOnceWith(
+      body,
+    );
+    expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
   });
 
   it("supports a contract declaring only status 201", async () => {
     const original = createContract();
-    const c = contract({
-      ...original,
-      responses: { 201: original.responses[200] },
-    });
+    const c = {
+      definition: {
+        ...original.definition,
+        responses: { 201: original.definition.responses[200] },
+      },
+    };
     const endpoint = serverContractHandler(c, async () => ({
       status: 201,
       body: date,
@@ -112,13 +123,15 @@ describe("serverContractHandler", () => {
     "supports status %s in a contract declaring only error responses",
     async (status) => {
       const original = createContract();
-      const c = contract({
-        ...original,
-        responses: {
-          404: original.responses[400],
-          500: original.responses[400],
+      const c = {
+        definition: {
+          ...original.definition,
+          responses: {
+            404: original.definition.responses[400],
+            500: original.definition.responses[400],
+          },
         },
-      });
+      };
       const body = { error: "Request failed" };
       const endpoint = serverContractHandler(c, async () => ({ status, body }));
 
@@ -145,7 +158,7 @@ describe("serverContractHandler", () => {
   it("extracts multiple decoded path parameters and query values", async () => {
     const c = createContract();
     const endpoint = serverContractHandler(
-      { ...c, path: "/groups/:group/items/:id" },
+      c.route("POST", "/groups/:group/items/:id", c.definition.params),
       async () => ({ status: 200, body: date }),
     );
 
@@ -156,11 +169,11 @@ describe("serverContractHandler", () => {
       ),
     );
 
-    expect(c.params.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
       group: "a/b",
       id: "hello world",
     });
-    expect(c.query.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({
       filter: "hello world",
       extra: "a/b",
     });
@@ -168,20 +181,18 @@ describe("serverContractHandler", () => {
 
   it("passes an absent GET body to the request codec as undefined", async () => {
     const c = createContract();
-    const request: Codec<undefined> = {
-      encode: (value) => value,
-      decode: vi.fn((_value: unknown) => undefined),
-    };
+    const request = zodCodec(z.undefined());
+    vi.spyOn(request, "decode");
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
     const endpoint = serverContractHandler(
-      { ...c, method: "GET", path: "/items", request },
+      c.route("GET", "/items", c.definition.params).request(request),
       handler,
     );
 
     await endpoint.fetch(new Request("https://example.com/items"));
 
-    expect(c.params.decode).toHaveBeenCalledExactlyOnceWith({});
-    expect(c.query.decode).toHaveBeenCalledExactlyOnceWith({});
+    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({});
+    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(request.decode).toHaveBeenCalledExactlyOnceWith(undefined);
     expect(handler).toHaveBeenCalledExactlyOnceWith({
       params: { id: 42 },
@@ -195,7 +206,7 @@ describe("serverContractHandler", () => {
     async (part) => {
       const c = createContract();
       const error = new Error(`Invalid ${part}`);
-      c[part].decode.mockImplementation(() => {
+      vi.mocked(c.definition[part].decode).mockImplementation(() => {
         throw error;
       });
       const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
@@ -203,8 +214,8 @@ describe("serverContractHandler", () => {
 
       await expect(endpoint.fetch(createRequest())).rejects.toBe(error);
       expect(handler).not.toHaveBeenCalled();
-      expect(c.responses[200].encode).not.toHaveBeenCalled();
-      expect(c.responses[400].encode).not.toHaveBeenCalled();
+      expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
+      expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
     },
   );
 
@@ -245,14 +256,14 @@ describe("serverContractHandler", () => {
     });
 
     await expect(endpoint.fetch(createRequest())).rejects.toBe(error);
-    expect(c.responses[200].encode).not.toHaveBeenCalled();
-    expect(c.responses[400].encode).not.toHaveBeenCalled();
+    expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
+    expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
   });
 
   it("propagates response encoding failures", async () => {
     const c = createContract();
     const error = new Error("Invalid response");
-    c.responses[200].encode.mockImplementation(() => {
+    vi.mocked(c.definition.responses[200].encode).mockImplementation(() => {
       throw error;
     });
     const endpoint = serverContractHandler(c, async () => ({
@@ -276,13 +287,15 @@ describe("serverContractHandler types", () => {
 
   it("infers response bodies only for the declared subset", () => {
     const original = createContract();
-    const c = contract({
-      ...original,
-      responses: {
-        201: original.responses[200],
-        503: original.responses[400],
+    const c = {
+      definition: {
+        ...original.definition,
+        responses: {
+          201: original.definition.responses[200],
+          503: original.definition.responses[400],
+        },
       },
-    });
+    };
     const endpoint = serverContractHandler(c, async (req) => {
       if (req.body.enabled) {
         return { status: 201, body: date };
@@ -310,12 +323,17 @@ describe("serverContractHandler types", () => {
   it("rejects response maps containing status codes absent from Hono", () => {
     const original = createContract();
     const invalid = {
-      ...original,
-      responses: { ...original.responses, 104: original.responses[200] },
+      definition: {
+        ...original.definition,
+        responses: {
+          ...original.definition.responses,
+          104: original.definition.responses[200],
+        },
+      },
     };
 
     // @ts-expect-error Status 104 is absent from Hono's StatusCode.
-    contract(invalid);
+    original.response(104, original.definition.responses[200]);
 
     // @ts-expect-error Direct handler construction also rejects status 104.
     serverContractHandler(invalid, async () => ({ status: 200, body: date }));

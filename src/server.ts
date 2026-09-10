@@ -19,15 +19,20 @@ export function serverContractHandler<
     req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
   ) => Promise<ContractResponse<NoInfer<TResponses>>>,
 ) {
+  const { definition } = c;
+  if (!definition.route) {
+    throw new Error("Contract must define a route with .route()");
+  }
+
   function decodeRequest(req: RequestExtract) {
     return {
-      params: c.params.decode(req.params),
-      query: c.query.decode(req.query),
-      body: c.request.decode(req.body),
+      params: definition.params.decode(req.params),
+      query: definition.query.decode(req.query),
+      body: definition.request.decode(req.body),
     };
   }
   function encodeResponse(res: ResponseExtract) {
-    const codec = c.responses[res.status];
+    const codec = definition.responses[res.status];
     if (!codec) throw new Error(`No encoder for status ${res.status}`);
 
     return {
@@ -37,11 +42,14 @@ export function serverContractHandler<
   }
 
   return {
-    method: c.method, // for server router
-    path: c.path, // for server router
+    method: definition.route.method, // for server router
+    path: definition.route.path, // for server router
     handler, // for testing
     async fetch(req: Request): Promise<Response> {
-      const requestExtract = await extractJsonRequest(req, c.path);
+      const requestExtract = await extractJsonRequest(
+        req,
+        definition.route.path,
+      );
       const decodedRequest = decodeRequest(requestExtract);
 
       const response = await handler(decodedRequest);

@@ -1,6 +1,8 @@
 export type Codec<TInput = unknown> = {
   encode(data: TInput): unknown;
   decode(encoded: unknown): TInput;
+  union<TOther>(other: Codec<TOther>): Codec<TInput | TOther>;
+  intersection<TOther>(other: Codec<TOther>): Codec<TInput & TOther>;
 };
 
 // Matches Hono's StatusCode
@@ -76,18 +78,40 @@ export type RequestMethod = "GET" | "POST";
 
 export type ResponseCodecs = Partial<Record<StatusCode, Codec>>;
 
+export type ContractRoute = {
+  readonly method: RequestMethod;
+  readonly path: string;
+};
+
+export type ContractDefinition<
+  TParams extends Codec,
+  TQuery extends Codec,
+  TRequestBody extends Codec,
+  TResponse extends ResponseCodecs,
+  TRoute extends ContractRoute | undefined = ContractRoute,
+> = {
+  readonly route: TRoute;
+  readonly params: TParams;
+  readonly query: TQuery;
+  readonly request: TRequestBody;
+  readonly responses: TResponse;
+};
+
 export type Contract<
   TParams extends Codec,
   TQuery extends Codec,
   TRequestBody extends Codec,
   TResponse extends ResponseCodecs,
 > = {
-  method: RequestMethod;
-  path: string;
-  params: TParams;
-  query: TQuery;
-  request: TRequestBody;
-  responses: TResponse & Record<Exclude<keyof TResponse, StatusCode>, never>;
+  readonly definition: ContractDefinition<
+    TParams,
+    TQuery,
+    TRequestBody,
+    TResponse
+  > & {
+    readonly responses: TResponse &
+      Record<Exclude<keyof TResponse, StatusCode>, never>;
+  };
 };
 
 /**

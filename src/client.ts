@@ -43,24 +43,29 @@ export function createClient(opts: ClientOptions): Client {
         TResponses
       >,
     ): TypesafeFetch<TParams, TQuery, TRequestBody, TResponses> {
+      const { definition } = c;
+      if (!definition.route) {
+        throw new Error("Contract must define a route with .route()");
+      }
+
       function encodeRequest(
         req: TypedRequest<TParams, TQuery, TRequestBody>,
       ): RequestExtract {
-        const params = c.params.encode(req.params);
+        const params = definition.params.encode(req.params);
         assertParams(params);
-        const query = c.query.encode(req.query);
+        const query = definition.query.encode(req.query);
         assertQuery(query);
 
         return {
           params,
           query,
-          body: c.request.encode(req.body),
+          body: definition.request.encode(req.body),
         };
       }
       function decodeResponse(
         response: Awaited<ReturnType<typeof extractJsonResponse>>,
       ): ContractResponse<TResponses> {
-        const codecs: Partial<Record<number, Codec>> = c.responses;
+        const codecs: Partial<Record<number, Codec>> = definition.responses;
         const codec = codecs[response.status];
         if (!codec) {
           throw new Error(`No decoder for status ${response.status}`);
@@ -81,8 +86,8 @@ export function createClient(opts: ClientOptions): Client {
         const request = createJsonRequest(
           encodedRequest,
           baseUrl,
-          c.method,
-          c.path,
+          definition.route.method,
+          definition.route.path,
         );
 
         const response = await doRequest(request);

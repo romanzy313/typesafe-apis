@@ -64,10 +64,11 @@ describe("example", () => {
   });
 
   it("uses the same path codec in both directions", () => {
-    expect(exampleContract.params.decode({ pathParam: "42.5" })).toEqual({
+    const { params } = exampleContract.definition;
+    expect(params.decode({ pathParam: "42.5" })).toEqual({
       pathParam: 42.5,
     });
-    expect(exampleContract.params.encode({ pathParam: 42.5 })).toEqual({
+    expect(params.encode({ pathParam: 42.5 })).toEqual({
       pathParam: "42.5",
     });
   });
@@ -111,15 +112,16 @@ describe("example", () => {
 describe("example types", () => {
   it("preserves schema output types through the codec adapter", () => {
     const codec = zodCodec(z.stringbool());
+    const { definition } = exampleContract;
 
     expectTypeOf(codec).toEqualTypeOf<Codec<boolean>>();
-    expectTypeOf(exampleContract.params.decode).returns.toEqualTypeOf<{
+    expectTypeOf(definition.params.decode).returns.toEqualTypeOf<{
       pathParam: number;
     }>();
-    expectTypeOf(exampleContract.query.decode).returns.toEqualTypeOf<{
+    expectTypeOf(definition.query.decode).returns.toEqualTypeOf<{
       queryParam: "a" | "b";
     }>();
-    expectTypeOf(exampleContract.request.decode).returns.toEqualTypeOf<{
+    expectTypeOf(definition.request.decode).returns.toEqualTypeOf<{
       requestParam: boolean;
     }>();
   });

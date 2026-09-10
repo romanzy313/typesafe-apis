@@ -12,17 +12,12 @@ const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   decode: (value) => Number.parseFloat(value),
   encode: (value) => value.toString(),
 });
-const itemContract = contract({
-  method: "POST",
-  path: "/items/:id",
-  params: zodCodec(z.object({ id: z.string() })),
-  query: zodCodec(z.object({ limit: stringToNumber, search: z.string() })),
-  request: zodCodec(z.object({ at: isoDatetimeToDate })),
-  responses: {
-    201: zodCodec(z.object({ createdAt: isoDatetimeToDate })),
-    400: zodCodec(z.object({ error: z.string() })),
-  },
-});
+const itemContract = contract()
+  .route("POST", "/items/:id", zodCodec(z.object({ id: z.string() })))
+  .query(zodCodec(z.object({ limit: stringToNumber, search: z.string() })))
+  .request(zodCodec(z.object({ at: isoDatetimeToDate })))
+  .response(201, zodCodec(z.object({ createdAt: isoDatetimeToDate })))
+  .response(400, zodCodec(z.object({ error: z.string() })));
 const date = new Date("2026-09-10T12:00:00.000Z");
 const input = {
   params: { id: "one" },
@@ -72,10 +67,9 @@ describe("createClient", () => {
     ["https://example.com/api/", "items/:id"],
   ])("joins base URL %s and path %s", async (baseUrl, path) => {
     const doRequest = createTransport();
-    const fetchItem = createClient({ baseUrl, doRequest }).contract({
-      ...itemContract,
-      path,
-    });
+    const fetchItem = createClient({ baseUrl, doRequest }).contract(
+      itemContract.route("POST", path, itemContract.definition.params),
+    );
 
     await fetchItem(input);
 
@@ -86,10 +80,13 @@ describe("createClient", () => {
 
   it("accepts an absolute contract URL without a base URL", async () => {
     const doRequest = createTransport();
-    const fetchItem = createClient({ doRequest }).contract({
-      ...itemContract,
-      path: "https://example.com/items/:id",
-    });
+    const fetchItem = createClient({ doRequest }).contract(
+      itemContract.route(
+        "POST",
+        "https://example.com/items/:id",
+        itemContract.definition.params,
+      ),
+    );
 
     await fetchItem(input);
 
@@ -106,10 +103,12 @@ describe("createClient", () => {
         baseUrl: "https://example.com",
         doRequest,
       }).contract({
-        ...itemContract,
-        method,
-        query: zodCodec(z.object({})),
-        request: zodCodec(z.undefined()),
+        definition: {
+          ...itemContract.definition,
+          route: { method, path: "/items/:id" },
+          query: zodCodec(z.object({})),
+          request: zodCodec(z.undefined()),
+        },
       });
 
       await fetchItem({ params: input.params, query: {}, body: undefined });
@@ -127,7 +126,7 @@ describe("createClient", () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
       doRequest,
-    }).contract({ ...itemContract, request: zodCodec(z.unknown()) });
+    }).contract(itemContract.request(zodCodec(z.unknown())));
 
     await fetchItem({ ...input, body });
 
@@ -152,8 +151,10 @@ describe("createClient", () => {
       baseUrl: "https://example.com",
       doRequest: async () => new Response(null, { status: 204 }),
     }).contract({
-      ...itemContract,
-      responses: { 204: zodCodec(z.undefined()) },
+      definition: {
+        ...itemContract.definition,
+        responses: { 204: zodCodec(z.undefined()) },
+      },
     });
 
     await expect(fetchItem(input)).resolves.toEqual({
@@ -173,11 +174,9 @@ describe("createClient", () => {
       const fetchItem = createClient({
         baseUrl: "https://example.com",
         doRequest,
-      }).contract({
-        ...itemContract,
-        path: `/items/:${name}`,
-        params: zodCodec(z.object({})),
-      });
+      }).contract(
+        itemContract.route("POST", `/items/:${name}`, zodCodec(z.object({}))),
+      );
 
       await expect(fetchItem({ ...input, params: {} })).rejects.toThrow(
         `Missing path parameter ${name}`,
@@ -194,8 +193,13 @@ describe("createClient", () => {
         baseUrl: "https://example.com",
         doRequest,
       }).contract({
-        ...itemContract,
-        [part]: { ...itemContract[part], encode: () => ({ value: 42 }) },
+        definition: {
+          ...itemContract.definition,
+          [part]: {
+            ...itemContract.definition[part],
+            encode: () => ({ value: 42 }),
+          },
+        },
       });
 
       await expect(fetchItem(input)).rejects.toThrow(
@@ -214,11 +218,13 @@ describe("createClient", () => {
         baseUrl: "https://example.com",
         doRequest,
       }).contract({
-        ...itemContract,
-        [part]: {
-          ...itemContract[part],
-          encode: () => {
-            throw error;
+        definition: {
+          ...itemContract.definition,
+          [part]: {
+            ...itemContract.definition[part],
+            encode: () => {
+              throw error;
+            },
           },
         },
       });
@@ -345,10 +351,12 @@ describe("createClient types", () => {
   it("rejects contracts with unsupported response statuses", () => {
     const client = createClient({ doRequest: createTransport() });
     const invalid = {
-      ...itemContract,
-      responses: {
-        201: itemContract.responses[201],
-        600: itemContract.responses[400],
+      definition: {
+        ...itemContract.definition,
+        responses: {
+          201: itemContract.definition.responses[201],
+          600: itemContract.definition.responses[400],
+        },
       },
     };
 
