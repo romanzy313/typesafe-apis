@@ -1,0 +1,97 @@
+import type {
+  Codec,
+  Contract,
+  ContractResponse,
+  RequestExtract,
+  ResponseCodecs,
+  ResponseExtract,
+  TypedRequest,
+} from "./types.js";
+
+export function serverContractHandler<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses extends ResponseCodecs,
+>(
+  c: Contract<Codec<TParams>, Codec<TQuery>, Codec<TRequestBody>, TResponses>,
+  handler: (
+    req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
+  ) => Promise<ContractResponse<NoInfer<TResponses>>>,
+) {
+  function decodeRequest(req: RequestExtract) {
+    return {
+      params: c.params.decode(req.params),
+      query: c.query.decode(req.query),
+      body: c.request.decode(req.body),
+    };
+  }
+  function encodeResponse(res: ResponseExtract) {
+    const codec = c.responses[res.status];
+    if (!codec) throw new Error(`No encoder for status ${res.status}`);
+
+    return {
+      status: res.status,
+      body: codec.encode(res.body),
+    };
+  }
+
+  return {
+    method: c.method, // for server router
+    path: c.path, // for server router
+    handler, // for testing
+    async fetch(req: Request): Promise<Response> {
+      const requestExtract = await extractJsonRequest(req, c.path);
+      const decodedRequest = decodeRequest(requestExtract);
+
+      const response = await handler(decodedRequest);
+
+      const encodedResponse = encodeResponse(response);
+      return createJsonResponse(encodedResponse);
+    },
+  };
+}
+
+export type ConcreteRequest = {
+  path: string; // make the path from params + query
+  body: string; // for now?
+};
+
+async function extractJsonRequest(
+  req: Request,
+  path: string,
+): Promise<RequestExtract> {
+  const url = new URL(req.url);
+  const pathSegments = path.split("/");
+  const requestSegments = url.pathname.split("/");
+
+  if (pathSegments.length !== requestSegments.length) {
+    throw new Error(`Request path does not match ${path}`);
+  }
+
+  const params = Object.fromEntries(
+    pathSegments.flatMap((segment, index) => {
+      const value = requestSegments[index];
+      if (segment.startsWith(":")) {
+        if (!value) throw new Error(`Request path does not match ${path}`);
+        return [[segment.slice(1), decodeURIComponent(value)]];
+      }
+      if (segment !== value) {
+        throw new Error(`Request path does not match ${path}`);
+      }
+      return [];
+    }),
+  );
+
+  return {
+    params,
+    query: Object.fromEntries(url.searchParams),
+    body: req.body === null ? undefined : await req.json(),
+  };
+}
+
+function createJsonResponse(responseExtract: ResponseExtract): Response {
+  return Response.json(responseExtract.body, {
+    status: responseExtract.status,
+  });
+}

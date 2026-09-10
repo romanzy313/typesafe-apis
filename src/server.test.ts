@@ -1,11 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
-import {
-  contract,
-  serverContractHandler,
-  type Codec,
-  type StatusCode,
-  type TypedRequest,
-} from "./prototype.js";
+import { serverContractHandler } from "./server.js";
+import { type Codec, type StatusCode, type TypedRequest } from "./types.js";
+import { contract } from "./contract.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 

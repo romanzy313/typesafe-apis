@@ -1,7 +1,10 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import z from "zod";
-import { exampleContract, exampleHandler, zodCodec } from "./example.js";
-import { serverContractHandler, type Codec } from "./prototype.js";
+import { exampleContract } from "./contract.js";
+import { serverContractHandler } from "../server.js";
+import { exampleHandler } from "./serverHandler.js";
+import type { Codec } from "../types.js";
+import { zodCodec } from "../codec.js";
 
 function createRequest(
   pathParam = "42",
@@ -79,7 +82,12 @@ describe("example", () => {
     },
     { name: "query", path: "42", query: "c", body: { requestParam: true } },
     { name: "missing body field", path: "42", query: "a", body: {} },
-    { name: "body type", path: "42", query: "a", body: { requestParam: "true" } },
+    {
+      name: "body type",
+      path: "42",
+      query: "a",
+      body: { requestParam: "true" },
+    },
   ])("rejects invalid $name values", async ({ path, query, body }) => {
     await expect(
       exampleHandler.fetch(createRequest(path, query, body)),

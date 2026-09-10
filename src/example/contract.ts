@@ -1,12 +1,6 @@
 import z from "zod";
-import { contract, serverContractHandler, type Codec } from "./prototype.js";
-
-export function zodCodec<TInput>(schema: z.ZodType<TInput>): Codec<TInput> {
-  return {
-    encode: (value) => schema.encode(value),
-    decode: (value) => schema.parse(value),
-  };
-}
+import { contract } from "../contract.js";
+import { zodCodec } from "../codec.js";
 
 // from
 // https://zod.dev/codecs#useful-codecs
@@ -43,22 +37,3 @@ export const exampleContract = contract({
     400: zodCodec(z.object({ error: z.string() })),
   },
 });
-
-export const exampleHandler = serverContractHandler(
-  exampleContract,
-  async (req) => {
-    if (!req.body.requestParam) {
-      return { status: 400, body: { error: "requestParam must be true" } };
-    }
-
-    return {
-      status: 200,
-      body: {
-        hi: "Hello",
-        pathParam: req.params.pathParam,
-        queryParam: req.query.queryParam,
-        requestParam: req.body.requestParam,
-      },
-    };
-  },
-);
