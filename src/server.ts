@@ -4,7 +4,6 @@ import type {
   ContractResponse,
   MinFetch,
   RequestExtract,
-  RequestMethod,
   ResponseCodecs,
   ResponseExtract,
   TypedRequest,
@@ -16,8 +15,12 @@ export type ServerHandler<
   TRequestBody,
   TResponses extends ResponseCodecs,
 > = {
-  method: RequestMethod;
-  path: string;
+  definition: Contract<
+    Codec<TParams>,
+    Codec<TQuery>,
+    Codec<TRequestBody>,
+    TResponses
+  >["definition"];
   handler: (
     req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
   ) => Promise<ContractResponse<NoInfer<TResponses>>>;
@@ -69,8 +72,7 @@ export function serverContractHandler<
   }
 
   return {
-    method: definition.route.method, // for server router
-    path: definition.route.path, // for server router
+    definition,
     handler, // for testing
     fetch,
   };

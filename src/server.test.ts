@@ -51,8 +51,11 @@ describe("serverContractHandler", () => {
 
     const response = await endpoint.fetch(createRequest());
 
-    expect(endpoint.method).toBe("POST");
-    expect(endpoint.path).toBe("/items/:id");
+    expect(endpoint.definition).toBe(c.definition);
+    expect(endpoint.definition.route.method).toBe("POST");
+    expect(endpoint.definition.route.path).toBe("/items/:id");
+    expect(endpoint).not.toHaveProperty("method");
+    expect(endpoint).not.toHaveProperty("path");
     expect(endpoint.handler).toBe(handler);
     expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
       id: "42",
@@ -364,6 +367,11 @@ describe("serverContractHandler types", () => {
         typeof c.definition.responses
       >
     >();
+    expectTypeOf(endpoint.definition.params.decode).returns.toEqualTypeOf<{
+      id: number;
+    }>();
+    expectTypeOf(endpoint.definition.responses[200].decode)
+      .returns.toEqualTypeOf<Date>();
     expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
