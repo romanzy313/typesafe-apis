@@ -1,3 +1,5 @@
+export type MinFetch = (request: Request) => Promise<Response>;
+
 export type Codec<TInput = unknown> = {
   encode(data: TInput): unknown;
   decode(encoded: unknown): TInput;

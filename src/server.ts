@@ -2,6 +2,7 @@ import type {
   Codec,
   Contract,
   ContractResponse,
+  MinFetch,
   RequestExtract,
   RequestMethod,
   ResponseCodecs,
@@ -20,7 +21,7 @@ export type ServerHandler<
   handler: (
     req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
   ) => Promise<ContractResponse<NoInfer<TResponses>>>;
-  fetch: typeof globalThis.fetch;
+  fetch: MinFetch;
 };
 
 export function serverContractHandler<
@@ -54,8 +55,7 @@ export function serverContractHandler<
     };
   }
 
-  const fetch: typeof globalThis.fetch = async (input, init) => {
-    const request = new Request(input, init);
+  async function fetch(request: Request) {
     const requestExtract = await extractJsonRequest(
       request,
       definition.route.path,
@@ -66,7 +66,7 @@ export function serverContractHandler<
 
     const encodedResponse = encodeResponse(response);
     return createJsonResponse(encodedResponse);
-  };
+  }
 
   return {
     method: definition.route.method, // for server router

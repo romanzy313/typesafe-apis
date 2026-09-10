@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
 import { type ServerHandler, serverContractHandler } from "./server.js";
-import { type StatusCode, type TypedRequest } from "./types.js";
+import type { MinFetch, StatusCode, TypedRequest } from "./types.js";
 import { contract } from "./contract.js";
 import { zodCodec } from "./codec.js";
 
@@ -75,36 +75,6 @@ describe("serverContractHandler", () => {
     expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("application/json");
-    expect(await response.json()).toBe(date.toISOString());
-  });
-
-  it.each([
-    ["URL string", "https://example.com/items/42?filter=a"],
-    ["URL object", new URL("https://example.com/items/42?filter=a")],
-    ["Request", createRequest()],
-  ] as const)("accepts a %s and applies request options", async (_name, input) => {
-    const c = createContract();
-    const endpoint = serverContractHandler(c, async () => ({
-      status: 200,
-      body: date,
-    }));
-
-    const response = await endpoint.fetch(input, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ enabled: false }),
-    });
-
-    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
-      id: "42",
-    });
-    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({
-      filter: "a",
-    });
-    expect(c.definition.request.decode).toHaveBeenCalledExactlyOnceWith({
-      enabled: false,
-    });
-    expect(response.status).toBe(200);
     expect(await response.json()).toBe(date.toISOString());
   });
 
@@ -219,7 +189,7 @@ describe("serverContractHandler", () => {
       handler,
     );
 
-    await endpoint.fetch("https://example.com/items");
+    await endpoint.fetch(new Request("https://example.com/items"));
 
     expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({});
@@ -397,7 +367,16 @@ describe("serverContractHandler types", () => {
     expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
-    expectTypeOf(endpoint.fetch).toEqualTypeOf<typeof globalThis.fetch>();
+    expectTypeOf(endpoint.fetch).toEqualTypeOf<MinFetch>();
+    const request = createRequest();
+    const url = new URL(request.url);
+    expectTypeOf(endpoint.fetch).toBeCallableWith(request);
+    // @ts-expect-error MinFetch requires a Request, not a URL string.
+    expectTypeOf(endpoint.fetch).toBeCallableWith(request.url);
+    // @ts-expect-error MinFetch requires a Request, not a URL object.
+    expectTypeOf(endpoint.fetch).toBeCallableWith(url);
+    // @ts-expect-error Request options must be supplied to the Request itself.
+    expectTypeOf(endpoint.fetch).toBeCallableWith(request, { method: "POST" });
   });
 
   it("narrows the response body by status", async () => {

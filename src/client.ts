@@ -2,6 +2,7 @@ import type {
   Codec,
   Contract,
   ContractResponse,
+  MinFetch,
   RequestExtract,
   RequestMethod,
   ResponseCodecs,
@@ -11,7 +12,7 @@ import type {
 export type ClientOptions = {
   // Prefix for endpoint paths; omit for browser-relative or absolute URLs.
   baseUrl?: string;
-  fetch?: typeof globalThis.fetch;
+  fetch?: MinFetch;
 };
 
 export type TypesafeFetch<

@@ -3,6 +3,7 @@ import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
+import type { MinFetch } from "./types.js";
 
 const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
   decode: (value) => new Date(value),
@@ -26,14 +27,14 @@ const input = {
 };
 
 function createTransport() {
-  return vi.fn<typeof globalThis.fetch>(async () =>
+  return vi.fn<MinFetch>(async () =>
     Response.json({ createdAt: date.toISOString() }, { status: 201 }),
   );
 }
 
 describe("createClient", () => {
   it("encodes requests and decodes the selected response", async () => {
-    const fetch = vi.fn<typeof globalThis.fetch>(async (request) => {
+    const fetch = vi.fn<MinFetch>(async (request) => {
       assert(request instanceof Request);
       const url = new URL(request.url);
       expect(url.origin).toBe("https://example.com");
