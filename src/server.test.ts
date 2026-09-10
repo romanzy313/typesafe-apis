@@ -1,6 +1,6 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
-import { serverContractHandler } from "./server.js";
+import { type ServerHandler, serverContractHandler } from "./server.js";
 import { type StatusCode, type TypedRequest } from "./types.js";
 import { contract } from "./contract.js";
 import { zodCodec } from "./codec.js";
@@ -370,7 +370,8 @@ describe("serverContractHandler types", () => {
   });
 
   it("infers decoded request values and status-specific response bodies", () => {
-    const endpoint = serverContractHandler(createContract(), async (req) => {
+    const c = createContract();
+    const endpoint = serverContractHandler(c, async (req) => {
       expectTypeOf(req).toEqualTypeOf<
         TypedRequest<
           { id: number },
@@ -385,6 +386,14 @@ describe("serverContractHandler types", () => {
       return { status: 400, body: { error: "Disabled" } };
     });
 
+    expectTypeOf(endpoint).toEqualTypeOf<
+      ServerHandler<
+        { id: number },
+        { filter: "a" | "b" },
+        { enabled: boolean },
+        typeof c.definition.responses
+      >
+    >();
     expectTypeOf(endpoint.handler).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();

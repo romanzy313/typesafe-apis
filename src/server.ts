@@ -3,10 +3,25 @@ import type {
   Contract,
   ContractResponse,
   RequestExtract,
+  RequestMethod,
   ResponseCodecs,
   ResponseExtract,
   TypedRequest,
 } from "./types.js";
+
+export type ServerHandler<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses extends ResponseCodecs,
+> = {
+  method: RequestMethod;
+  path: string;
+  handler: (
+    req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
+  ) => Promise<ContractResponse<NoInfer<TResponses>>>;
+  fetch: typeof globalThis.fetch;
+};
 
 export function serverContractHandler<
   TParams,
@@ -15,10 +30,8 @@ export function serverContractHandler<
   TResponses extends ResponseCodecs,
 >(
   c: Contract<Codec<TParams>, Codec<TQuery>, Codec<TRequestBody>, TResponses>,
-  handler: (
-    req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
-  ) => Promise<ContractResponse<NoInfer<TResponses>>>,
-) {
+  handler: ServerHandler<TParams, TQuery, TRequestBody, TResponses>["handler"],
+): ServerHandler<TParams, TQuery, TRequestBody, TResponses> {
   const { definition } = c;
   if (!definition.route) {
     throw new Error("Contract must define a route with .route()");
