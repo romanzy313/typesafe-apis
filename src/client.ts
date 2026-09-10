@@ -3,13 +3,13 @@ import type {
   Contract,
   ContractResponse,
   RequestExtract,
+  RequestMethod,
   ResponseCodecs,
-  ResponseExtract,
-  StatusCode,
   TypedRequest,
 } from "./types.js";
 
 export type ClientOptions = {
+  // Prefix for endpoint paths; omit for browser-relative or absolute URLs.
   baseUrl?: string;
   // minimal fetch here
   doRequest: (request: Request) => Promise<Response>;
@@ -21,8 +21,8 @@ export type TypesafeFetch<
   TRequestBody,
   TResponses extends ResponseCodecs,
 > = (
-  typedRequest: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
-) => Promise<ContractResponse<NoInfer<TResponses>>>;
+  typedRequest: TypedRequest<TParams, TQuery, TRequestBody>,
+) => Promise<ContractResponse<TResponses>>;
 
 export type Client = {
   contract<TParams, TQuery, TRequestBody, TResponses extends ResponseCodecs>(
@@ -44,56 +44,118 @@ export function createClient(opts: ClientOptions): Client {
       >,
     ): TypesafeFetch<TParams, TQuery, TRequestBody, TResponses> {
       function encodeRequest(
-        req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
+        req: TypedRequest<TParams, TQuery, TRequestBody>,
       ): RequestExtract {
+        const params = c.params.encode(req.params);
+        assertParams(params);
+        const query = c.query.encode(req.query);
+        assertQuery(query);
+
         return {
-          params: c.params.encode(req.params),
-          query: c.query.encode(req.query),
+          params,
+          query,
           body: c.request.encode(req.body),
         };
       }
-      function decodeResponse(res: ResponseExtract) {
-        const codec = c.responses[res.status];
-        if (!codec) throw new Error(`No encoder for status ${res.status}`);
+      function decodeResponse(
+        response: Awaited<ReturnType<typeof extractJsonResponse>>,
+      ): ContractResponse<TResponses> {
+        const codecs: Partial<Record<number, Codec>> = c.responses;
+        const codec = codecs[response.status];
+        if (!codec) {
+          throw new Error(`No decoder for status ${response.status}`);
+        }
 
+        // The selected codec validates the body for this declared status.
         return {
-          status: res.status,
-          body: codec.decode(res.body),
-        };
+          status: response.status,
+          body: codec.decode(response.body),
+        } as ContractResponse<TResponses>;
       }
 
       return async (
-        typedRequest: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
-      ): Promise<ContractResponse<NoInfer<TResponses>>> => {
+        typedRequest: TypedRequest<TParams, TQuery, TRequestBody>,
+      ): Promise<ContractResponse<TResponses>> => {
         const encodedRequest = encodeRequest(typedRequest);
 
-        const request = createJsonRequest(encodedRequest, c.path, baseUrl);
+        const request = createJsonRequest(
+          encodedRequest,
+          baseUrl,
+          c.method,
+          c.path,
+        );
 
         const response = await doRequest(request);
+        const responseExtract = await extractJsonResponse(response);
 
-        const responseExtract = await extractJsonResponse(response); // this could fail too? like body ended due to network error
-        const decodedResponse = decodeResponse(responseExtract);
-
-        return decodedResponse;
+        return decodeResponse(responseExtract);
       };
     },
   };
 }
 
-function createJsonRequest(
-  requestExtract: RequestExtract,
-  path: string,
-  baseUrl: string,
-): Request {
-  // TODO
-  return new Request("TODO");
+function assertParams(
+  params: unknown,
+): asserts params is RequestExtract["params"] {
+  if (
+    typeof params !== "object" ||
+    params === null ||
+    Array.isArray(params) ||
+    Object.values(params).some((value) => typeof value !== "string")
+  ) {
+    throw new TypeError("Encoded params must be an object of strings");
+  }
 }
 
-async function extractJsonResponse(
-  response: Response,
-): Promise<ResponseExtract> {
-  return {
-    status: response.status as StatusCode,
-    body: await response.json(), // TODO
-  };
+function assertQuery(query: unknown): asserts query is RequestExtract["query"] {
+  if (
+    typeof query !== "object" ||
+    query === null ||
+    Array.isArray(query) ||
+    Object.values(query).some((value) => typeof value !== "string")
+  ) {
+    throw new TypeError("Encoded query must be an object of strings");
+  }
+}
+
+function createJsonRequest(
+  requestExtract: RequestExtract,
+  baseUrl: string,
+  method: RequestMethod,
+  path: string,
+): Request {
+  const pathname = path
+    .split("/")
+    .map((segment) => {
+      if (!segment.startsWith(":")) return segment;
+
+      const name = segment.slice(1);
+      const value = requestExtract.params[name];
+      if (!Object.hasOwn(requestExtract.params, name) || value === undefined) {
+        throw new Error(`Missing path parameter ${name}`);
+      }
+      return encodeURIComponent(value);
+    })
+    .join("/");
+  const url = baseUrl
+    ? `${baseUrl.replace(/\/+$/, "")}/${pathname.replace(/^\/+/, "")}`
+    : pathname;
+  const query = new URLSearchParams(requestExtract.query).toString();
+  const body =
+    requestExtract.body === undefined
+      ? null
+      : JSON.stringify(requestExtract.body);
+
+  return new Request(query ? `${url}?${query}` : url, {
+    method,
+    headers: body === null ? {} : { "content-type": "application/json" },
+    body,
+  });
+}
+
+async function extractJsonResponse(response: Response) {
+  const body: unknown =
+    response.body === null ? undefined : await response.json();
+
+  return { status: response.status, body };
 }

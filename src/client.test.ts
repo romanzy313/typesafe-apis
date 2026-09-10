@@ -1,0 +1,358 @@
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import z from "zod";
+import { createClient } from "./client.js";
+import { zodCodec } from "./codec.js";
+import { contract } from "./contract.js";
+
+const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
+  decode: (value) => new Date(value),
+  encode: (value) => value.toISOString(),
+});
+const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
+  decode: (value) => Number.parseFloat(value),
+  encode: (value) => value.toString(),
+});
+const itemContract = contract({
+  method: "POST",
+  path: "/items/:id",
+  params: zodCodec(z.object({ id: z.string() })),
+  query: zodCodec(z.object({ limit: stringToNumber, search: z.string() })),
+  request: zodCodec(z.object({ at: isoDatetimeToDate })),
+  responses: {
+    201: zodCodec(z.object({ createdAt: isoDatetimeToDate })),
+    400: zodCodec(z.object({ error: z.string() })),
+  },
+});
+const date = new Date("2026-09-10T12:00:00.000Z");
+const input = {
+  params: { id: "one" },
+  query: { limit: 0, search: "" },
+  body: { at: date },
+};
+
+function createTransport() {
+  return vi.fn(async (_request: Request) =>
+    Response.json({ createdAt: date.toISOString() }, { status: 201 }),
+  );
+}
+
+describe("createClient", () => {
+  it("encodes requests and decodes the selected response", async () => {
+    const doRequest = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      expect(url.origin).toBe("https://example.com");
+      expect(url.pathname).toBe("/api/items/one%2Ftwo%20%3F%23%25");
+      expect([...url.searchParams]).toEqual([
+        ["limit", "0"],
+        ["search", "a & b+c/?#"],
+      ]);
+      expect(url.hash).toBe("");
+      expect(request.method).toBe("POST");
+      expect(request.headers.get("content-type")).toBe("application/json");
+      expect(await request.json()).toEqual({ at: date.toISOString() });
+      return Response.json({ createdAt: date.toISOString() }, { status: 201 });
+    });
+    const fetchItem = createClient({
+      baseUrl: "https://example.com/api/",
+      doRequest,
+    }).contract(itemContract);
+
+    const response = await fetchItem({
+      params: { id: "one/two ?#%" },
+      query: { limit: 0, search: "a & b+c/?#" },
+      body: { at: date },
+    });
+
+    expect(doRequest).toHaveBeenCalledTimes(1);
+    expect(response).toEqual({ status: 201, body: { createdAt: date } });
+  });
+
+  it.each([
+    ["https://example.com/api", "/items/:id"],
+    ["https://example.com/api/", "items/:id"],
+  ])("joins base URL %s and path %s", async (baseUrl, path) => {
+    const doRequest = createTransport();
+    const fetchItem = createClient({ baseUrl, doRequest }).contract({
+      ...itemContract,
+      path,
+    });
+
+    await fetchItem(input);
+
+    expect(doRequest.mock.calls[0]?.[0].url).toBe(
+      "https://example.com/api/items/one?limit=0&search=",
+    );
+  });
+
+  it("accepts an absolute contract URL without a base URL", async () => {
+    const doRequest = createTransport();
+    const fetchItem = createClient({ doRequest }).contract({
+      ...itemContract,
+      path: "https://example.com/items/:id",
+    });
+
+    await fetchItem(input);
+
+    expect(doRequest.mock.calls[0]?.[0].url).toBe(
+      "https://example.com/items/one?limit=0&search=",
+    );
+  });
+
+  it.each(["GET", "POST"] as const)(
+    "sends a %s request without a body when the codec encodes undefined",
+    async (method) => {
+      const doRequest = createTransport();
+      const fetchItem = createClient({
+        baseUrl: "https://example.com",
+        doRequest,
+      }).contract({
+        ...itemContract,
+        method,
+        query: zodCodec(z.object({})),
+        request: zodCodec(z.undefined()),
+      });
+
+      await fetchItem({ params: input.params, query: {}, body: undefined });
+
+      const request = doRequest.mock.calls[0]?.[0];
+      expect(request?.url).toBe("https://example.com/items/one");
+      expect(request?.method).toBe(method);
+      expect(request?.body).toBeNull();
+      expect(request?.headers.has("content-type")).toBe(false);
+    },
+  );
+
+  it.each([false, 0, "", null])("preserves the JSON body %j", async (body) => {
+    const doRequest = createTransport();
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest,
+    }).contract({ ...itemContract, request: zodCodec(z.unknown()) });
+
+    await fetchItem({ ...input, body });
+
+    expect(await doRequest.mock.calls[0]?.[0].json()).toEqual(body);
+  });
+
+  it("decodes declared error responses", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () =>
+        Response.json({ error: "Invalid item" }, { status: 400 }),
+    }).contract(itemContract);
+
+    await expect(fetchItem(input)).resolves.toEqual({
+      status: 400,
+      body: { error: "Invalid item" },
+    });
+  });
+
+  it("decodes an absent response body as undefined", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () => new Response(null, { status: 204 }),
+    }).contract({
+      ...itemContract,
+      responses: { 204: zodCodec(z.undefined()) },
+    });
+
+    await expect(fetchItem(input)).resolves.toEqual({
+      status: 204,
+      body: undefined,
+    });
+    expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<{
+      status: 204;
+      body: undefined;
+    }>();
+  });
+
+  it.each(["id", "toString"])(
+    "rejects a missing path parameter %s before calling the transport",
+    async (name) => {
+      const doRequest = createTransport();
+      const fetchItem = createClient({
+        baseUrl: "https://example.com",
+        doRequest,
+      }).contract({
+        ...itemContract,
+        path: `/items/:${name}`,
+        params: zodCodec(z.object({})),
+      });
+
+      await expect(fetchItem({ ...input, params: {} })).rejects.toThrow(
+        `Missing path parameter ${name}`,
+      );
+      expect(doRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["params", "query"] as const)(
+    "rejects non-string values encoded by the %s codec",
+    async (part) => {
+      const doRequest = createTransport();
+      const fetchItem = createClient({
+        baseUrl: "https://example.com",
+        doRequest,
+      }).contract({
+        ...itemContract,
+        [part]: { ...itemContract[part], encode: () => ({ value: 42 }) },
+      });
+
+      await expect(fetchItem(input)).rejects.toThrow(
+        `Encoded ${part} must be an object of strings`,
+      );
+      expect(doRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["params", "query", "request"] as const)(
+    "propagates %s encoding errors before calling the transport",
+    async (part) => {
+      const error = new Error(`Cannot encode ${part}`);
+      const doRequest = createTransport();
+      const fetchItem = createClient({
+        baseUrl: "https://example.com",
+        doRequest,
+      }).contract({
+        ...itemContract,
+        [part]: {
+          ...itemContract[part],
+          encode: () => {
+            throw error;
+          },
+        },
+      });
+
+      await expect(fetchItem(input)).rejects.toBe(error);
+      expect(doRequest).not.toHaveBeenCalled();
+    },
+  );
+
+  it("propagates transport failures", async () => {
+    const error = new Error("Connection failed");
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () => {
+        throw error;
+      },
+    }).contract(itemContract);
+
+    await expect(fetchItem(input)).rejects.toBe(error);
+  });
+
+  it.each([500, 599])("rejects undeclared status %s", async (status) => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () => Response.json({ error: "Unexpected" }, { status }),
+    }).contract(itemContract);
+
+    await expect(fetchItem(input)).rejects.toThrow(
+      `No decoder for status ${status}`,
+    );
+  });
+
+  it("validates the body with the selected response codec", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () =>
+        Response.json({ createdAt: "invalid" }, { status: 201 }),
+    }).contract(itemContract);
+
+    await expect(fetchItem(input)).rejects.toBeInstanceOf(z.ZodError);
+  });
+
+  it("rejects malformed response JSON", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () => new Response("{", { status: 201 }),
+    }).contract(itemContract);
+
+    await expect(fetchItem(input)).rejects.toBeInstanceOf(SyntaxError);
+  });
+
+  it("propagates failures while reading the response body", async () => {
+    const error = new Error("Response body interrupted");
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(error);
+            },
+          }),
+          { status: 201 },
+        ),
+    }).contract(itemContract);
+
+    await expect(fetchItem(input)).rejects.toBe(error);
+  });
+});
+
+describe("createClient types", () => {
+  it("infers decoded arguments and the declared response union", () => {
+    const fetchItem = createClient({ doRequest: createTransport() }).contract(
+      itemContract,
+    );
+
+    expectTypeOf(fetchItem).parameter(0).toEqualTypeOf<{
+      params: { id: string };
+      query: { limit: number; search: string };
+      body: { at: Date };
+    }>();
+    expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
+      | { status: 201; body: { createdAt: Date } }
+      | { status: 400; body: { error: string } }
+    >();
+    expectTypeOf(fetchItem).toBeCallableWith(input);
+
+    expectTypeOf(fetchItem).toBeCallableWith({
+      ...input,
+      // @ts-expect-error The decoded path parameter must be a string.
+      params: { id: 42 },
+    });
+    expectTypeOf(fetchItem).toBeCallableWith({
+      ...input,
+      // @ts-expect-error The client takes a number before URL encoding.
+      query: { limit: "42", search: "" },
+    });
+    expectTypeOf(fetchItem).toBeCallableWith({
+      ...input,
+      // @ts-expect-error The client takes a Date before JSON encoding.
+      body: { at: date.toISOString() },
+    });
+    // @ts-expect-error The request body is required.
+    expectTypeOf(fetchItem).toBeCallableWith({
+      params: input.params,
+      query: input.query,
+    });
+  });
+
+  it("narrows decoded response bodies by status", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      doRequest: createTransport(),
+    }).contract(itemContract);
+    const response = await fetchItem(input);
+
+    if (response.status === 201) {
+      expectTypeOf(response.body).toEqualTypeOf<{ createdAt: Date }>();
+    } else {
+      expectTypeOf(response.body).toEqualTypeOf<{ error: string }>();
+    }
+  });
+
+  it("rejects contracts with unsupported response statuses", () => {
+    const client = createClient({ doRequest: createTransport() });
+    const invalid = {
+      ...itemContract,
+      responses: {
+        201: itemContract.responses[201],
+        600: itemContract.responses[400],
+      },
+    };
+
+    // @ts-expect-error A client contract cannot declare status 600.
+    client.contract(invalid);
+  });
+});
