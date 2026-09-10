@@ -22,9 +22,8 @@ type AddResponse<
   >;
 };
 
-type AddQuery<TQuery, TNextQuery> = [TQuery] extends [Record<string, never>]
-  ? TNextQuery
-  : TQuery & TNextQuery;
+type AddQuery<THasQuery extends boolean, TQuery, TNextQuery> =
+  THasQuery extends false ? TNextQuery : TQuery & TNextQuery;
 
 export class ContractBuilder<
   TParams,
@@ -32,6 +31,7 @@ export class ContractBuilder<
   TRequestBody,
   TResponses extends ResponseCodecs,
   TRoute extends ContractRoute | undefined,
+  THasQuery extends boolean = true,
 > {
   constructor(
     readonly definition: ContractDefinition<
@@ -41,7 +41,7 @@ export class ContractBuilder<
       TResponses,
       TRoute
     >,
-    private readonly hasQuery = true,
+    private readonly hasQuery: THasQuery,
   ) {}
 
   route<TNextParams>(
@@ -63,8 +63,8 @@ export class ContractBuilder<
     return new ContractBuilder(
       {
         ...this.definition,
-        // An empty query contributes no fields to the intersection.
-        query: query as Codec<AddQuery<TQuery, TNextQuery>>,
+        // Only an unconfigured query is replaced; existing types intersect.
+        query: query as Codec<AddQuery<THasQuery, TQuery, TNextQuery>>,
       },
       true,
     );

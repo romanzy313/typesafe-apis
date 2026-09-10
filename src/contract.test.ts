@@ -265,6 +265,56 @@ describe("contract composition", () => {
     });
   });
 
+  it("preserves conflicting fields when a query is extended again", () => {
+    const c = contract()
+      .query(zodCodec(z.object({ page: z.string() })))
+      .query(zodCodec(z.object({ page: z.number() })))
+      .route("GET", "/items/:id", params)
+      .request(zodCodec(z.undefined()))
+      .response(200, zodCodec(z.object({ ok: z.boolean() })))
+      .query(zodCodec(z.object({ filter: z.string() })));
+    const query = c.definition.query;
+
+    expectTypeOf(query.decode).returns.toEqualTypeOf<
+      { page: string } & { page: number } & { filter: string }
+    >();
+    const endpoint = serverContractHandler(c, async (req) => {
+      expectTypeOf(req.query.page).toBeNever();
+      return { status: 200, body: { ok: true } };
+    });
+    const fetchItem = createClient({ doRequest: endpoint.fetch }).contract(c);
+
+    expectTypeOf(fetchItem).toEqualTypeOf<typeof endpoint.handler>();
+    expectTypeOf(fetchItem).toBeCallableWith({
+      params: { id: 1 },
+      // @ts-expect-error The conflicting page field must not disappear.
+      query: { filter: "active" },
+      body: undefined,
+    });
+
+    for (const page of ["2", 2]) {
+      const input = { page, filter: "active" };
+      expect(() => query.decode(input)).toThrow(z.ZodError);
+      expect(() => {
+        // @ts-expect-error No string or number satisfies both page types.
+        query.encode(input);
+      }).toThrow(z.ZodError);
+    }
+  });
+
+  it("preserves an impossible query after conflicting discriminators", () => {
+    const c = contract()
+      .query(zodCodec(z.object({ mode: z.literal("a") })))
+      .query(zodCodec(z.object({ mode: z.literal("b") })))
+      .query(zodCodec(z.object({ filter: z.string() })));
+
+    expectTypeOf(c.definition.query.decode).returns.toBeNever();
+    expectTypeOf(c.definition.query.encode).parameter(0).toBeNever();
+    expect(() =>
+      c.definition.query.decode({ mode: "a", filter: "active" }),
+    ).toThrow(z.ZodError);
+  });
+
   it("preserves constraints on shared query fields", () => {
     const c = contract()
       .query(zodCodec(z.object({ name: z.string().min(2) })))
