@@ -30,6 +30,7 @@ describe("example client types", () => {
           };
         }
       | { status: 400; body: { error: string } }
+      | { status: 403; body: { error: "auth_please" } }
     >();
   });
 

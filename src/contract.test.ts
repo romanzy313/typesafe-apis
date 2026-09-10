@@ -94,8 +94,7 @@ describe("contract composition", () => {
     const base = contract()
       .query(zodCodec(z.object({ page: stringToNumber })))
       .response(403, zodCodec(z.object({ error: z.literal("forbidden") })));
-    const final = base
-      .route("GET", "/items/:id", params)
+    const other = contract()
       .query(
         zodCodec(
           z.object({ action: z.enum(["read", "forbidden", "disabled"]) }),
@@ -111,6 +110,31 @@ describe("contract composition", () => {
           }),
         ),
       );
+    const final = base.merge(other).route("GET", "/items/:id", params);
+
+    expect(final).not.toBe(base);
+    expect(final).not.toBe(other);
+    expect(base.definition.route).toBeUndefined();
+    expect(other.definition.route).toBeUndefined();
+    expect(Object.keys(base.definition.responses)).toEqual(["403"]);
+    expect(() =>
+      base.definition.responses[403].decode({
+        error: "disabled",
+        data: { id: 7 },
+      }),
+    ).toThrow(z.ZodError);
+    expect(() =>
+      other.definition.responses[403].decode({ error: "forbidden" }),
+    ).toThrow(z.ZodError);
+    expect(final.definition.query.encode({ page: 2, action: "read" })).toEqual({
+      page: "2",
+      action: "read",
+    });
+    expect(base.definition.query.decode({ page: "2" })).toEqual({ page: 2 });
+    expect(other.definition.query.decode({ action: "read" })).toEqual({
+      action: "read",
+    });
+
     const builder = serverEndpoint().contract(final);
     const endpoint = builder.handler(async (req) => {
       expectTypeOf(req.params).toEqualTypeOf<{ id: number }>();
@@ -202,8 +226,13 @@ describe("contract composition", () => {
 
   it("rejects missing routes at binding time and in the type system", () => {
     const base = contract()
-      .query(zodCodec(z.object({ page: stringToNumber })))
-      .response(401, zodCodec(z.object({ error: z.literal("unauthorized") })));
+      .merge(contract().query(zodCodec(z.object({ page: stringToNumber }))))
+      .merge(
+        contract().response(
+          401,
+          zodCodec(z.object({ error: z.literal("unauthorized") })),
+        ),
+      );
     const handler = vi.fn(async () => ({
       status: 401 as const,
       body: { error: "unauthorized" as const },
@@ -270,13 +299,14 @@ describe("contract composition", () => {
     });
   });
 
-  it("preserves conflicting fields when a query is extended again", () => {
+  it("preserves conflicting fields when merged queries are extended", () => {
     const c = contract()
       .query(zodCodec(z.object({ page: z.string() })))
-      .query(zodCodec(z.object({ page: z.number() })))
+      .merge(contract().query(zodCodec(z.object({ page: z.number() }))))
       .route("GET", "/items/:id", params)
       .request(zodCodec(z.undefined()))
       .response(200, zodCodec(z.object({ ok: z.boolean() })))
+      .merge(contract())
       .query(zodCodec(z.object({ filter: z.string() })));
     const query = c.definition.query;
 
@@ -336,5 +366,147 @@ describe("contract composition", () => {
     expect(() => c.definition.query.encode({ name: "abcde" })).toThrow(
       z.ZodError,
     );
+  });
+});
+
+describe("contract merge", () => {
+  it("treats unconfigured parts as neutral on either side", async () => {
+    const empty = contract();
+    const configured = contract()
+      .route("POST", "/items/:id", params)
+      .query(zodCodec(z.object({ page: stringToNumber })))
+      .request(zodCodec(z.object({ name: z.string() })))
+      .response(201, zodCodec(z.object({ created: z.boolean() })));
+
+    for (const merged of [
+      empty.merge(configured),
+      configured.merge(empty),
+      empty.merge(empty).merge(configured),
+      configured.merge(empty.merge(empty)),
+    ]) {
+      const endpoint = serverEndpoint()
+        .contract(merged)
+        .handler(async (req) => {
+          expectTypeOf(req).toEqualTypeOf<{
+            params: { id: number };
+            query: { page: number };
+            body: { name: string };
+          }>();
+          expect(req).toEqual({
+            params: { id: 7 },
+            query: { page: 2 },
+            body: { name: "item" },
+          });
+          return { status: 201, body: { created: true } };
+        });
+      const fetchItem = createClient({
+        baseUrl: "https://example.com",
+        fetch: (request) => endpoint.fetchWithContext(request, {}),
+      }).contract(merged);
+
+      expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<{
+        status: 201;
+        body: { created: boolean };
+      }>();
+      expect(merged.definition.route).toEqual({
+        method: "POST",
+        path: "/items/:id",
+      });
+      await expect(
+        fetchItem({
+          params: { id: 7 },
+          query: { page: 2 },
+          body: { name: "item" },
+        }),
+      ).resolves.toEqual({ status: 201, body: { created: true } });
+    }
+    expect(empty.definition.route).toBeUndefined();
+    expect(empty.definition.query.decode({})).toEqual({});
+    expect(empty.definition.request.decode(undefined)).toBeUndefined();
+    expect(empty.definition.responses).toEqual({});
+  });
+
+  it("allows configuration after merging empty bases", () => {
+    const merged = contract().merge(contract());
+    expectTypeOf(merged.definition.route).toBeUndefined();
+    expectTypeOf(merged.definition.query.decode).returns.toEqualTypeOf<
+      Record<string, never>
+    >();
+    expectTypeOf(merged.definition.request.decode).returns.toBeUndefined();
+
+    const configured = merged
+      .query(zodCodec(z.object({ page: stringToNumber })))
+      .merge(contract().request(zodCodec(z.boolean())));
+    expectTypeOf(configured.definition.query.decode).returns.toEqualTypeOf<{
+      page: number;
+    }>();
+    expectTypeOf(configured.definition.request.decode).returns.toBeBoolean();
+    expect(configured.definition.query.decode({ page: "2" })).toEqual({
+      page: 2,
+    });
+    expect(configured.definition.request.decode(true)).toBe(true);
+  });
+
+  it("combines a route and a request body from separate bases", () => {
+    const route = contract().route("POST", "/items/:id", params);
+    const body = contract().request(zodCodec(z.object({ name: z.string() })));
+
+    for (const merged of [route.merge(body), body.merge(route)]) {
+      expectTypeOf(merged.definition.params.decode).returns.toEqualTypeOf<{
+        id: number;
+      }>();
+      expectTypeOf(merged.definition.request.decode).returns.toEqualTypeOf<{
+        name: string;
+      }>();
+      expect(merged.definition.route).toEqual({
+        method: "POST",
+        path: "/items/:id",
+      });
+      expect(merged.definition.params.decode({ id: "7" })).toEqual({ id: 7 });
+      expect(merged.definition.request.decode({ name: "item" })).toEqual({
+        name: "item",
+      });
+    }
+  });
+
+  it("rejects two configured routes, including routes inherited by merge", () => {
+    const first = contract().route("GET", "/first/:id", params);
+    const second = contract().route("GET", "/second/:id", params);
+    const inherited = contract()
+      .merge(first)
+      .query(zodCodec(z.object({ page: stringToNumber })))
+      .response(200, zodCodec(z.string()));
+
+    expect(() => {
+      // @ts-expect-error Both contracts already define a route.
+      first.merge(second);
+    }).toThrow("Cannot merge contracts that both define a route");
+    expect(() => {
+      // @ts-expect-error An inherited route is still a configured route.
+      inherited.merge(second);
+    }).toThrow("Cannot merge contracts that both define a route");
+  });
+
+  it("rejects two explicit bodies, including an explicit undefined body", () => {
+    const body = contract().request(zodCodec(z.object({ name: z.string() })));
+    const noBody = contract().request(zodCodec(z.undefined()));
+    const inherited = contract()
+      .merge(body)
+      .query(zodCodec(z.object({ page: stringToNumber })))
+      .response(200, zodCodec(z.string()))
+      .route("POST", "/items/:id", params);
+
+    expect(() => {
+      // @ts-expect-error Matching schemas still constitute two explicit bodies.
+      body.merge(body);
+    }).toThrow("Cannot merge contracts that both define a request body");
+    expect(() => {
+      // @ts-expect-error Explicit undefined is different from an unset body.
+      body.merge(noBody);
+    }).toThrow("Cannot merge contracts that both define a request body");
+    expect(() => {
+      // @ts-expect-error Chaining preserves the inherited body requirement.
+      inherited.merge(noBody);
+    }).toThrow("Cannot merge contracts that both define a request body");
   });
 });

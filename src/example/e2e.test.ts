@@ -1,10 +1,35 @@
 import { assert, describe, expect, expectTypeOf, it } from "vitest";
 import { createClient } from "../client.js";
+import { serverEndpoint } from "../server.js";
 import type { ContractResponse } from "../types.js";
 import { exampleContract } from "./contract.js";
 import { exampleHandler } from "./serverHandler.js";
 
 describe("example end-to-end", () => {
+  it("round-trips the auth response from the merged contract", async () => {
+    const endpoint = serverEndpoint()
+      .contract(exampleContract)
+      .handler(async () => ({ status: 403, body: { error: "auth_please" } }));
+    const fetchExample = createClient({
+      baseUrl: "https://example.com",
+      fetch: (request) => endpoint.fetchWithContext(request, {}),
+    }).contract(exampleContract);
+
+    const response = await fetchExample({
+      params: { pathParam: 42 },
+      query: { queryParam: "a" },
+      body: { requestParam: true },
+    });
+
+    expect(response).toEqual({
+      status: 403,
+      body: { error: "auth_please" },
+    });
+    if (response.status === 403) {
+      expectTypeOf(response.body).toEqualTypeOf<{ error: "auth_please" }>();
+    }
+  });
+
   it("round-trips a typed request through HTTP JSON and the server handler", async () => {
     const expectedBody = {
       hi: "Hello",

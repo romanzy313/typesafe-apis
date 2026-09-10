@@ -82,7 +82,7 @@ describe("example", () => {
     ).rejects.toBeInstanceOf(z.ZodError);
   });
 
-  it.each([200, 400] as const)(
+  it.each([200, 400, 403] as const)(
     "validates the response body for status %s at runtime",
     async (status) => {
       const untypedHandler = async () => ({ status, body: {} });
@@ -131,6 +131,7 @@ describe("example types", () => {
           };
         }
       | { status: 400; body: { error: string } }
+      | { status: 403; body: { error: "auth_please" } }
     >();
   });
 
@@ -145,5 +146,11 @@ describe("example types", () => {
         requestParam: req.body.requestParam,
       },
     }));
+  });
+
+  it("requires the auth error literal for status 403", () => {
+    const builder = serverEndpoint().contract(exampleContract);
+    // @ts-expect-error The auth contract requires the literal auth_please.
+    builder.handler(async () => ({ status: 403, body: { error: "other" } }));
   });
 });
