@@ -160,8 +160,8 @@ export function contractHandler<
   >,
 ): ServerEndpoint<TParams, TQuery, TRequestBody, TResponses, TServerContext> {
   const { definition } = contract;
-  if (!definition.route) {
-    throw new Error("Contract must define a route with .route()");
+  if (!definition.route.method) {
+    throw new Error("Contract must define a method with .method()");
   }
 
   function decodeRequest(req: RequestExtract) {

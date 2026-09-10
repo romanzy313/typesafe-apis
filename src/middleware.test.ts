@@ -15,7 +15,8 @@ const authContract = contract()
   .query(zodCodec(z.object({ fail: z.stringbool() })))
   .response(403, zodCodec(z.object({ error: z.literal("auth_please") })));
 const testContract = authContract
-  .route("POST", "/test/:id", zodCodec(z.object({ id: stringToNumber })))
+  .method("POST")
+  .path("/test/:id", zodCodec(z.object({ id: stringToNumber })))
   .request(zodCodec(z.object({ name: z.string() })))
   .response(200, zodCodec(z.object({ hello: z.string() })))
   .response(418, zodCodec(z.object({ funFact: z.string() })));
@@ -391,7 +392,8 @@ describe("middleware composition", () => {
 
   it("reuses middleware across compatible contracts", async () => {
     const otherContract = authContract
-      .route("GET", "/other/:slug", zodCodec(z.object({ slug: z.string() })))
+      .method("GET")
+      .path("/other/:slug", zodCodec(z.object({ slug: z.string() })))
       .query(zodCodec(z.object({ locale: z.string() })))
       .response(201, zodCodec(z.object({ location: z.string() })));
     const bound = serverEndpoint<ServerContext>()
@@ -619,16 +621,16 @@ describe("middleware composition", () => {
     ).rejects.toThrow("Middleware returned undefined");
   });
 
-  it("requires a route before binding a handler", () => {
+  it("requires a method before binding a handler", () => {
     expect(() => {
       serverEndpoint<ServerContext>()
-        // @ts-expect-error The base contract has no route.
+        // @ts-expect-error The base contract has no method.
         .contract(authContract)
         .handler(async () => ({
           status: 403,
           body: { error: "auth_please" },
         }));
-    }).toThrow("Contract must define a route with .route()");
+    }).toThrow("Contract must define a method with .method()");
   });
 });
 
@@ -734,7 +736,8 @@ describe("middleware types", () => {
 
   it("checks middleware contract requirements", () => {
     const wrongQueryContract = contract()
-      .route("GET", "/wrong", zodCodec(z.object({})))
+      .method("GET")
+      .path("/wrong", zodCodec(z.object({})))
       .query(zodCodec(z.object({ fail: z.string() })))
       .response(403, authContract.definition.responses[403]);
     const wrongQuery = serverEndpoint<ServerContext>()
@@ -746,7 +749,8 @@ describe("middleware types", () => {
     wrongQuery.use(authenticate);
 
     const missingResponseContract = contract()
-      .route("GET", "/missing", zodCodec(z.object({})))
+      .method("GET")
+      .path("/missing", zodCodec(z.object({})))
       .query(authContract.definition.query)
       .response(200, zodCodec(z.string()));
     const missingResponse = serverEndpoint<ServerContext>()

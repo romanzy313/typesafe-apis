@@ -9,10 +9,13 @@ const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   encode: (num) => num.toString(),
 });
 
-export const auth = contract()
-  .response(403, zodCodec(z.object({ error: z.literal("auth_please") })));
+export const auth = contract().response(
+  403,
+  zodCodec(z.object({ error: z.literal("auth_please") })),
+);
 
 const base = contract()
+  .path("/test/")
   .query(
     zodCodec(
       z.object({ queryParam: z.union([z.literal("a"), z.literal("b")]) }),
@@ -22,9 +25,9 @@ const base = contract()
 
 export const exampleContract = base
   .merge(auth)
-  .route(
-    "POST",
-    "/test/:pathParam",
+  .method("POST")
+  .path(
+    "/:pathParam",
     zodCodec(z.object({ pathParam: stringToNumber })),
   )
   .request(zodCodec(z.object({ requestParam: z.boolean() })))

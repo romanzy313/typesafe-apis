@@ -80,8 +80,10 @@ export type RequestMethod = "GET" | "POST";
 
 export type ResponseCodecs = Partial<Record<StatusCode, Codec>>;
 
-export type ContractRoute = {
-  readonly method: RequestMethod;
+export type ContractRoute<
+  TMethod extends RequestMethod | undefined = RequestMethod,
+> = {
+  readonly method: TMethod;
   readonly path: string;
 };
 
@@ -90,9 +92,9 @@ export type ContractDefinition<
   TQuery extends Codec,
   TRequestBody extends Codec,
   TResponse extends ResponseCodecs,
-  TRoute extends ContractRoute | undefined = ContractRoute,
+  TMethod extends RequestMethod | undefined = RequestMethod,
 > = {
-  readonly route: TRoute;
+  readonly route: ContractRoute<TMethod>;
   readonly params: TParams;
   readonly query: TQuery;
   readonly request: TRequestBody;

@@ -13,12 +13,14 @@ const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   decode: (value) => Number.parseFloat(value),
   encode: (value) => value.toString(),
 });
-const itemContract = contract()
-  .route("POST", "/items/:id", zodCodec(z.object({ id: z.string() })))
+const itemBase = contract()
   .query(zodCodec(z.object({ limit: stringToNumber, search: z.string() })))
-  .request(zodCodec(z.object({ at: isoDatetimeToDate })))
   .response(201, zodCodec(z.object({ createdAt: isoDatetimeToDate })))
   .response(400, zodCodec(z.object({ error: z.string() })));
+const itemContract = itemBase
+  .method("POST")
+  .path("/items/:id", zodCodec(z.object({ id: z.string() })))
+  .request(zodCodec(z.object({ at: isoDatetimeToDate })));
 const date = new Date("2026-09-10T12:00:00.000Z");
 const input = {
   params: { id: "one" },
@@ -75,7 +77,10 @@ describe("createClient", () => {
   ])("joins base URL %s and path %s", async (baseUrl, path) => {
     const fetch = createTransport();
     const fetchItem = createClient({ baseUrl, fetch }).contract(
-      itemContract.route("POST", path, itemContract.definition.params),
+      itemBase
+        .method("POST")
+        .path(path, itemContract.definition.params)
+        .request(itemContract.definition.request),
     );
 
     await fetchItem(input);
@@ -90,11 +95,10 @@ describe("createClient", () => {
   it("accepts an absolute contract URL without a base URL", async () => {
     const fetch = createTransport();
     const fetchItem = createClient({ fetch }).contract(
-      itemContract.route(
-        "POST",
-        "https://example.com/items/:id",
-        itemContract.definition.params,
-      ),
+      itemBase
+        .method("POST")
+        .path("https://example.com/items/:id", itemContract.definition.params)
+        .request(itemContract.definition.request),
     );
 
     await fetchItem(input);
@@ -144,7 +148,12 @@ describe("createClient", () => {
     const fetchItem = createClient({
       baseUrl: "https://example.com",
       fetch,
-    }).contract(itemContract.request(zodCodec(z.unknown())));
+    }).contract(
+      itemBase
+        .method("POST")
+        .path("/items/:id", itemContract.definition.params)
+        .request(zodCodec(z.unknown())),
+    );
 
     await fetchItem({ ...input, body });
 
@@ -214,7 +223,10 @@ describe("createClient", () => {
         baseUrl: "https://example.com",
         fetch,
       }).contract(
-        itemContract.route("POST", `/items/:${name}`, zodCodec(z.object({}))),
+        itemBase
+          .method("POST")
+          .path(`/items/:${name}`)
+          .request(itemContract.definition.request),
       );
 
       await expect(fetchItem({ ...input, params: {} })).rejects.toThrow(

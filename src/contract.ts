@@ -3,7 +3,6 @@ import { zodCodec } from "./codec.js";
 import type {
   Codec,
   ContractDefinition,
-  ContractRoute,
   RequestMethod,
   ResponseCodecs,
   StatusCode,
@@ -22,17 +21,26 @@ type AddResponse<
   >;
 };
 
-type AddQuery<THasQuery extends boolean, TQuery, TNextQuery> =
-  THasQuery extends false ? TNextQuery : TQuery & TNextQuery;
+type AddInput<THasInput extends boolean, TInput, TNextInput> =
+  THasInput extends false ? TNextInput : TInput & TNextInput;
 
-type MergeQuery<
-  THasQuery extends boolean,
-  TNextHasQuery extends boolean,
-  TQuery,
-  TNextQuery,
-> = TNextHasQuery extends true
-  ? AddQuery<THasQuery, TQuery, TNextQuery>
-  : TQuery;
+type MergeInput<
+  THasInput extends boolean,
+  TNextHasInput extends boolean,
+  TInput,
+  TNextInput,
+> = TNextHasInput extends true
+  ? AddInput<THasInput, TInput, TNextInput>
+  : TInput;
+
+type CompatibleMethods<
+  TMethod extends RequestMethod | undefined,
+  TNextMethod extends RequestMethod | undefined,
+> = undefined extends TMethod | TNextMethod
+  ? unknown
+  : [TMethod & TNextMethod] extends [never]
+    ? never
+    : unknown;
 
 type MergeResponses<
   TResponses extends ResponseCodecs,
@@ -56,7 +64,8 @@ export class ContractBuilder<
   TQuery,
   TRequestBody,
   TResponses extends ResponseCodecs,
-  TRoute extends ContractRoute | undefined,
+  TMethod extends RequestMethod | undefined,
+  THasParams extends boolean = true,
   THasQuery extends boolean = true,
   THasRequest extends boolean = true,
 > {
@@ -66,21 +75,72 @@ export class ContractBuilder<
       Codec<TQuery>,
       Codec<TRequestBody>,
       TResponses,
-      TRoute
+      TMethod
     >,
+    private readonly hasParams: THasParams,
     private readonly hasQuery: THasQuery,
     private readonly hasRequest: THasRequest,
+    private readonly hasPath: boolean,
   ) {}
 
-  route<TNextParams>(
-    method: RequestMethod,
-    path: string,
-    params: Codec<TNextParams>,
+  /** Set the method; repeated declarations must agree. */
+  method<TNextMethod extends RequestMethod>(
+    method: TNextMethod & NoInfer<CompatibleMethods<TMethod, TNextMethod>>,
   ) {
+    assertCompatibleMethods(this.definition.route.method, method);
     return new ContractBuilder(
-      { ...this.definition, route: { method, path }, params },
+      { ...this.definition, route: { ...this.definition.route, method } },
+      this.hasParams,
       this.hasQuery,
       this.hasRequest,
+      this.hasPath,
+    );
+  }
+
+  /** Append a path and intersect params; static fragments can omit the codec. */
+  path(fragment: string): ContractBuilder<
+    TParams,
+    TQuery,
+    TRequestBody,
+    TResponses,
+    TMethod,
+    THasParams,
+    THasQuery,
+    THasRequest
+  >;
+  path<TNextParams>(
+    fragment: string,
+    codec: Codec<TNextParams>,
+  ): ContractBuilder<
+    AddInput<THasParams, TParams, TNextParams>,
+    TQuery,
+    TRequestBody,
+    TResponses,
+    TMethod,
+    true,
+    THasQuery,
+    THasRequest
+  >;
+  path<TNextParams>(fragment: string, codec?: Codec<TNextParams>) {
+    const path = joinPaths(
+      this.hasPath ? this.definition.route.path : "",
+      fragment,
+    );
+    const params = codec
+      ? this.hasParams
+        ? this.definition.params.intersection(codec)
+        : codec
+      : this.definition.params;
+    return new ContractBuilder(
+      {
+        ...this.definition,
+        route: { ...this.definition.route, path },
+        params: params as Codec<TParams | TNextParams>,
+      },
+      this.hasParams || codec !== undefined,
+      this.hasQuery,
+      this.hasRequest,
+      this.hasPath || fragment !== "",
     );
   }
 
@@ -93,19 +153,31 @@ export class ContractBuilder<
       {
         ...this.definition,
         // Only an unconfigured query is replaced; existing types intersect.
-        query: query as Codec<AddQuery<THasQuery, TQuery, TNextQuery>>,
+        query: query as Codec<AddInput<THasQuery, TQuery, TNextQuery>>,
       },
+      this.hasParams,
       true,
       this.hasRequest,
+      this.hasPath,
     );
   }
 
-  /** Set the request body codec; an omitted body defaults to undefined. */
+  /** Require both body codecs; an unconfigured body defaults to undefined. */
   request<TNextBody>(codec: Codec<TNextBody>) {
+    const request = this.hasRequest
+      ? this.definition.request.intersection(codec)
+      : codec;
     return new ContractBuilder(
-      { ...this.definition, request: codec },
+      {
+        ...this.definition,
+        request: request as Codec<
+          AddInput<THasRequest, TRequestBody, TNextBody>
+        >,
+      },
+      this.hasParams,
       this.hasQuery,
       true,
+      this.hasPath,
     );
   }
 
@@ -123,18 +195,21 @@ export class ContractBuilder<
 
     return new ContractBuilder(
       { ...this.definition, responses },
+      this.hasParams,
       this.hasQuery,
       this.hasRequest,
+      this.hasPath,
     );
   }
 
-  /** Combine queries and responses; reject duplicate routes or bodies. */
+  /** Append paths, intersect inputs, and union responses for each status. */
   merge<
     TNextParams,
     TNextQuery,
     TNextBody,
     TNextResponses extends ResponseCodecs,
-    TNextRoute extends ContractRoute | undefined,
+    TNextMethod extends RequestMethod | undefined,
+    TNextHasParams extends boolean,
     TNextHasQuery extends boolean,
     TNextHasRequest extends boolean,
   >(
@@ -143,35 +218,36 @@ export class ContractBuilder<
       TNextQuery,
       TNextBody,
       TNextResponses,
-      TNextRoute,
+      TNextMethod,
+      TNextHasParams,
       TNextHasQuery,
       TNextHasRequest
     > &
-      NoInfer<
-        (TRoute extends ContractRoute
-          ? TNextRoute extends ContractRoute
-            ? never
-            : unknown
-          : unknown) &
-        (THasRequest extends true
-          ? TNextHasRequest extends true
-            ? never
-            : unknown
-          : unknown)
-      >,
+      NoInfer<CompatibleMethods<TMethod, TNextMethod>>,
   ) {
-    if (this.definition.route && other.definition.route) {
-      throw new Error("Cannot merge contracts that both define a route");
-    }
-    if (this.hasRequest && other.hasRequest) {
-      throw new Error("Cannot merge contracts that both define a request body");
-    }
-
+    assertCompatibleMethods(
+      this.definition.route.method,
+      other.definition.route.method,
+    );
+    const path = joinPaths(
+      this.hasPath ? this.definition.route.path : "",
+      other.hasPath ? other.definition.route.path : "",
+    );
+    const params = other.hasParams
+      ? this.hasParams
+        ? this.definition.params.intersection(other.definition.params)
+        : other.definition.params
+      : this.definition.params;
     const query = other.hasQuery
       ? this.hasQuery
         ? this.definition.query.intersection(other.definition.query)
         : other.definition.query
       : this.definition.query;
+    const request = other.hasRequest
+      ? this.hasRequest
+        ? this.definition.request.intersection(other.definition.request)
+        : other.definition.request
+      : this.definition.request;
     const responses: ResponseCodecs = { ...this.definition.responses };
     for (const key of Object.keys(other.definition.responses)) {
       const status = Number(key) as StatusCode;
@@ -184,43 +260,73 @@ export class ContractBuilder<
     // Conditional types reflect the runtime selection of configured parts.
     return new ContractBuilder(
       {
-        route: (this.definition.route ?? other.definition.route) as (
-          TRoute extends undefined ? TNextRoute : TRoute
-        ),
-        params: (this.definition.route
-          ? this.definition.params
-          : other.definition.params) as Codec<
-          TRoute extends undefined ? TNextParams : TParams
+        route: {
+          method: (this.definition.route.method ??
+            other.definition.route.method) as (
+            TMethod extends undefined ? TNextMethod : TMethod
+          ),
+          path,
+        },
+        params: params as Codec<
+          MergeInput<THasParams, TNextHasParams, TParams, TNextParams>
         >,
         query: query as Codec<
-          MergeQuery<THasQuery, TNextHasQuery, TQuery, TNextQuery>
+          MergeInput<THasQuery, TNextHasQuery, TQuery, TNextQuery>
         >,
-        request: (this.hasRequest
-          ? this.definition.request
-          : other.definition.request) as Codec<
-          THasRequest extends true ? TRequestBody : TNextBody
+        request: request as Codec<
+          MergeInput<THasRequest, TNextHasRequest, TRequestBody, TNextBody>
         >,
         responses: responses as MergeResponses<TResponses, TNextResponses>,
       },
+      (this.hasParams || other.hasParams) as Either<THasParams, TNextHasParams>,
       (this.hasQuery || other.hasQuery) as Either<THasQuery, TNextHasQuery>,
       (this.hasRequest || other.hasRequest) as Either<
         THasRequest,
         TNextHasRequest
       >,
+      this.hasPath || other.hasPath,
     );
   }
 }
 
-/** Start a reusable base; call .route() before binding a client or handler. */
+function assertCompatibleMethods(
+  method: RequestMethod | undefined,
+  nextMethod: RequestMethod | undefined,
+) {
+  if (method && nextMethod && method !== nextMethod) {
+    throw new Error(
+      `Cannot compose different methods: ${method} and ${nextMethod}`,
+    );
+  }
+}
+
+function joinPaths(first: string, second: string): string {
+  const path =
+    first && second
+      ? `${first.replace(/\/+$/, "")}/${second.replace(/^\/+/, "")}`
+      : first || second || "/";
+  const names = new Set<string>();
+  for (const segment of path.split("/")) {
+    if (!segment.startsWith(":")) continue;
+    const name = segment.slice(1);
+    if (names.has(name)) throw new Error(`Duplicate path parameter ${name}`);
+    names.add(name);
+  }
+  return path;
+}
+
+/** Start a reusable base; call .method() before binding a client or handler. */
 export function contract() {
   return new ContractBuilder(
     {
-      route: undefined,
+      route: { method: undefined, path: "/" },
       params: zodCodec(z.object({})),
       query: zodCodec(z.object({})),
       request: zodCodec(z.undefined()),
       responses: {},
     },
+    false,
+    false,
     false,
     false,
   );

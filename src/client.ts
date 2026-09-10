@@ -44,8 +44,8 @@ export function createClient(opts: ClientOptions = {}): Client {
       >,
     ): TypesafeFetch<TParams, TQuery, TRequestBody, TResponses> {
       const { definition } = c;
-      if (!definition.route) {
-        throw new Error("Contract must define a route with .route()");
+      if (!definition.route.method) {
+        throw new Error("Contract must define a method with .method()");
       }
 
       function encodeRequest(

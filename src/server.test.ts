@@ -7,7 +7,7 @@ import type { RequestContext, StatusCode, TypedRequest } from "./types.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 
-function createContract() {
+function createContract(path = "/items/:id") {
   const stringToNumber = z.codec(z.string(), z.number(), {
     decode: Number,
     encode: String,
@@ -17,7 +17,8 @@ function createContract() {
     encode: (value) => value.toISOString(),
   });
   const c = contract()
-    .route("POST", "/items/:id", zodCodec(z.object({ id: stringToNumber })))
+    .method("POST")
+    .path(path, zodCodec(z.object({ id: stringToNumber })))
     .query(zodCodec(z.object({ filter: z.enum(["a", "b"]) })))
     .request(zodCodec(z.object({ enabled: z.boolean() })))
     .response(200, zodCodec(isoDatetimeToDate))
@@ -226,11 +227,9 @@ describe("serverEndpoint", () => {
   });
 
   it("extracts multiple decoded path parameters and query values", async () => {
-    const c = createContract();
+    const c = createContract("/groups/:group/items/:id");
     const endpoint = serverEndpoint()
-      .contract(
-        c.route("POST", "/groups/:group/items/:id", c.definition.params),
-      )
+      .contract(c)
       .handler(async () => ({ status: 200, body: date }));
 
     await endpoint.fetchWithContext(
@@ -257,9 +256,13 @@ describe("serverEndpoint", () => {
     vi.spyOn(request, "decode");
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
     const endpoint = serverEndpoint()
-      .contract(
-        c.route("GET", "/items", c.definition.params).request(request),
-      )
+      .contract({
+        definition: {
+          ...c.definition,
+          route: { method: "GET", path: "/items" },
+          request,
+        },
+      })
       .handler(handler);
 
     await endpoint.fetchWithContext(
