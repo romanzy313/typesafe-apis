@@ -1,0 +1,502 @@
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
+import z from "zod";
+import { createClient } from "./client.js";
+import { zodCodec } from "./codec.js";
+import { contract } from "./contract.js";
+import {
+  contractHandler,
+  endpoint,
+  type MiddlewareHandler,
+} from "./endpoint.js";
+
+const stringToNumber = z.codec(z.string(), z.number(), {
+  decode: Number,
+  encode: String,
+});
+const authContract = contract()
+  .query(zodCodec(z.object({ fail: z.stringbool() })))
+  .response(403, zodCodec(z.object({ error: z.literal("auth_please") })));
+const testContract = authContract
+  .route("POST", "/test/:id", zodCodec(z.object({ id: stringToNumber })))
+  .request(zodCodec(z.object({ name: z.string() })))
+  .response(200, zodCodec(z.object({ hello: z.string() })))
+  .response(418, zodCodec(z.object({ funFact: z.string() })));
+
+type ServerContext = { greeting: string; userName: string };
+type TraceContext = { traceId: string };
+type AuthContext = { user: { name: string } };
+const serverContext: Readonly<ServerContext> = Object.freeze({
+  greeting: "Hello",
+  userName: "Ada",
+});
+
+const authenticate: MiddlewareHandler<
+  unknown,
+  { fail: boolean },
+  unknown,
+  typeof authContract.definition.responses,
+  { userName: string },
+  TraceContext,
+  AuthContext
+> = async (req, server, context, next) => {
+  expectTypeOf(context.traceId).toEqualTypeOf<string>();
+  if (req.query.fail) {
+    return { status: 403, body: { error: "auth_please" } };
+  }
+  return next({ user: { name: server.userName } });
+};
+
+function createRequest(id = 7, fail = false) {
+  return new Request(`https://example.com/test/${id}?fail=${fail}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "world" }),
+  });
+}
+
+function tracedEndpoint() {
+  return endpoint<ServerContext>()
+    .contract(testContract)
+    .use<TraceContext>(async (req, _server, _context, next) =>
+      next({ traceId: `request-${req.params.id}` }),
+    );
+}
+
+describe("endpoint", () => {
+  it("runs nested middleware through HTTP JSON", async () => {
+    const order: string[] = [];
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      .use<TraceContext>(async (req, server, context, next) => {
+        expect(context).toEqual({});
+        expect(server).toBe(serverContext);
+        expect(req).toEqual({
+          params: { id: 7 },
+          query: { fail: false },
+          body: { name: "world" },
+        });
+        order.push("trace before");
+        const response = await next({ traceId: `request-${req.params.id}` });
+        order.push("trace after");
+        return response;
+      })
+      .use(authenticate)
+      .use(async (_req, _server, context, next) => {
+        expect(context).toEqual({
+          traceId: "request-7",
+          user: { name: "Ada" },
+        });
+        order.push("inner before");
+        const response = await next({});
+        order.push("inner after");
+        return response;
+      })
+      .handler(async (req, server, context) => {
+        expectTypeOf(req.params.id).toEqualTypeOf<number>();
+        expectTypeOf(req.query.fail).toEqualTypeOf<boolean>();
+        expectTypeOf(context.traceId).toEqualTypeOf<string>();
+        expectTypeOf(context.user).toEqualTypeOf<AuthContext["user"]>();
+        expect(context.traceId).toBe("request-7");
+        order.push("handler");
+        return {
+          status: 200,
+          body: {
+            hello: `${server.greeting} ${context.user.name}, ${req.body.name}`,
+          },
+        };
+      });
+    const fetch = createClient({
+      baseUrl: "https://example.com",
+      fetch: (request) => bound.fetchWithContext(request, serverContext),
+    }).contract(testContract);
+
+    await expect(
+      fetch({
+        params: { id: 7 },
+        query: { fail: false },
+        body: { name: "world" },
+      }),
+    ).resolves.toEqual({ status: 200, body: { hello: "Hello Ada, world" } });
+    expect(bound.definition).toBe(testContract.definition);
+    expect(order).toEqual([
+      "trace before",
+      "inner before",
+      "handler",
+      "inner after",
+      "trace after",
+    ]);
+  });
+
+  it("short-circuits the chain with an auth response", async () => {
+    const outerResponse = vi.fn();
+    const afterAuth = vi.fn();
+    const handlerCalled = vi.fn();
+    const bound = tracedEndpoint()
+      .use(async (_req, _server, _context, next) => {
+        const response = await next({});
+        outerResponse(response.status);
+        return response;
+      })
+      .use(authenticate)
+      .use(async (_req, _server, _context, next) => {
+        afterAuth();
+        return next({});
+      })
+      .handler(async () => {
+        handlerCalled();
+        return { status: 200, body: { hello: "world" } };
+      });
+
+    const response = await bound.fetchWithContext(
+      createRequest(7, true),
+      serverContext,
+    );
+
+    expect(response.status).toBe(403);
+    expect(response.headers.get("content-type")).toBe("application/json");
+    expect(await response.json()).toEqual({ error: "auth_please" });
+    expect(outerResponse).toHaveBeenCalledExactlyOnceWith(403);
+    expect(afterAuth).not.toHaveBeenCalled();
+    expect(handlerCalled).not.toHaveBeenCalled();
+  });
+
+  it("reuses middleware across compatible contracts", async () => {
+    const otherContract = authContract
+      .route("GET", "/other/:slug", zodCodec(z.object({ slug: z.string() })))
+      .query(zodCodec(z.object({ locale: z.string() })))
+      .response(201, zodCodec(z.object({ location: z.string() })));
+    const bound = endpoint<ServerContext>()
+      .contract(otherContract)
+      .use<TraceContext>(async (req, _server, _context, next) =>
+        next({ traceId: req.params.slug }),
+      )
+      .use(authenticate)
+      .handler(async (req, _server, context) => ({
+        status: 201,
+        body: {
+          location: `${req.query.locale}/${context.user.name}/${context.traceId}`,
+        },
+      }));
+
+    const response = await bound.fetchWithContext(
+      new Request("https://example.com/other/item?fail=false&locale=en"),
+      serverContext,
+    );
+
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ location: "en/Ada/item" });
+  });
+
+  it("branches chains and replaces request context fields", async () => {
+    const base = tracedEndpoint().use(authenticate);
+    const replaced = base
+      .use<{ traceId: number }>(async (_req, _server, context, next) =>
+        next({ traceId: context.traceId.length }),
+      )
+      .handler(async (_req, _server, context) => {
+        expectTypeOf(context.traceId).toEqualTypeOf<number>();
+        expectTypeOf(context.user).toEqualTypeOf<AuthContext["user"]>();
+        return {
+          status: 200,
+          body: { hello: `${context.user.name}:${context.traceId}` },
+        };
+      });
+    const original = base.handler(async (_req, _server, context) => {
+      expectTypeOf(context.traceId).toEqualTypeOf<string>();
+      return {
+        status: 200,
+        body: { hello: `${context.user.name}:${context.traceId}` },
+      };
+    });
+
+    const [left, right] = await Promise.all([
+      replaced.fetchWithContext(createRequest(), serverContext),
+      original.fetchWithContext(createRequest(), serverContext),
+    ]);
+
+    expect(await left.json()).toEqual({ hello: "Ada:9" });
+    expect(await right.json()).toEqual({ hello: "Ada:request-7" });
+  });
+
+  it("retains context fields omitted by optional updates", async () => {
+    const bound = tracedEndpoint()
+      .use<{ traceId?: number }>(async (req, _server, _context, next) =>
+        next(req.query.fail ? { traceId: 42 } : {}),
+      )
+      .handler(async (_req, _server, context) => {
+        expectTypeOf(context.traceId).toEqualTypeOf<string | number>();
+        return { status: 200, body: { hello: String(context.traceId) } };
+      });
+
+    const [unchanged, updated] = await Promise.all([
+      bound.fetchWithContext(createRequest(), serverContext),
+      bound.fetchWithContext(createRequest(7, true), serverContext),
+    ]);
+
+    expect(await unchanged.json()).toEqual({ hello: "request-7" });
+    expect(await updated.json()).toEqual({ hello: "42" });
+  });
+
+  it("starts concurrent requests with separate empty contexts", async () => {
+    const contexts: object[] = [];
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      .use<{ requestId: number }>(async (req, server, context, next) => {
+        expect(context).toEqual({});
+        expect(server).toBe(serverContext);
+        contexts.push(context);
+        await Promise.resolve();
+        return next({ requestId: req.params.id });
+      })
+      .handler(async (_req, server, context) => {
+        await Promise.resolve();
+        return {
+          status: 200,
+          body: { hello: `${server.greeting}:${context.requestId}` },
+        };
+      });
+
+    const [first, second] = await Promise.all([
+      bound.fetchWithContext(createRequest(1), serverContext),
+      bound.fetchWithContext(createRequest(2), serverContext),
+    ]);
+
+    expect(contexts).toHaveLength(2);
+    expect(contexts[0]).not.toBe(contexts[1]);
+    expect(await first.json()).toEqual({ hello: "Hello:1" });
+    expect(await second.json()).toEqual({ hello: "Hello:2" });
+    expect(serverContext).toEqual({ greeting: "Hello", userName: "Ada" });
+  });
+
+  it("binds a handler directly with both contexts", async () => {
+    const bound = contractHandler(
+      testContract,
+      async (req, server: Readonly<ServerContext>, context) => {
+        expectTypeOf(context).toEqualTypeOf<{}>();
+        expect(context).toEqual({});
+        return {
+          status: 200,
+          body: { hello: `${server.greeting} ${req.body.name}` },
+        };
+      },
+    );
+
+    const response = await bound.fetchWithContext(
+      createRequest(),
+      serverContext,
+    );
+
+    expect(await response.json()).toEqual({ hello: "Hello world" });
+  });
+
+  it("validates the request before calling middleware", async () => {
+    const called = vi.fn();
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      .use(async (_req, _server, _context, next) => {
+        called();
+        return next({});
+      })
+      .handler(async () => ({ status: 200, body: { hello: "world" } }));
+    const request = new Request("https://example.com/test/7?fail=invalid", {
+      method: "POST",
+      body: JSON.stringify({ name: "world" }),
+    });
+
+    await expect(
+      bound.fetchWithContext(request, serverContext),
+    ).rejects.toBeInstanceOf(z.ZodError);
+    expect(called).not.toHaveBeenCalled();
+  });
+
+  it.each(["middleware", "handler"] as const)(
+    "propagates %s failures",
+    async (source) => {
+      const error = new Error("Request failed");
+      const bound = endpoint<ServerContext>()
+        .contract(testContract)
+        .use(async (_req, _server, _context, next) => {
+          if (source === "middleware") throw error;
+          return next({});
+        })
+        .handler(async () => {
+          throw error;
+        });
+
+      await expect(
+        bound.fetchWithContext(createRequest(), serverContext),
+      ).rejects.toBe(error);
+    },
+  );
+
+  it("rejects undeclared middleware responses", async () => {
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      // @ts-expect-error Status 500 is not declared by the contract.
+      .use(async () => ({ status: 500 as const, body: { error: "failed" } }))
+      .handler(async () => ({ status: 200, body: { hello: "world" } }));
+
+    await expect(
+      bound.fetchWithContext(createRequest(), serverContext),
+    ).rejects.toThrow("No encoder for status 500");
+  });
+
+  it("validates a short-circuited response body", async () => {
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      // @ts-expect-error The declared error is the literal auth_please.
+      .use(async () => ({ status: 403 as const, body: { error: 42 } }))
+      .handler(async () => ({ status: 200, body: { hello: "world" } }));
+
+    await expect(
+      bound.fetchWithContext(createRequest(), serverContext),
+    ).rejects.toBeInstanceOf(z.ZodError);
+  });
+
+  it("rejects middleware that returns no response", async () => {
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      // @ts-expect-error Middleware must return its own response or next().
+      .use(async () => undefined)
+      .handler(async () => ({ status: 200, body: { hello: "world" } }));
+
+    await expect(
+      bound.fetchWithContext(createRequest(), serverContext),
+    ).rejects.toThrow("Middleware returned undefined");
+  });
+
+  it("requires a route before binding a handler", () => {
+    expect(() => {
+      endpoint<ServerContext>()
+        // @ts-expect-error The base contract has no route.
+        .contract(authContract)
+        .handler(async () => ({
+          status: 403,
+          body: { error: "auth_please" },
+        }));
+    }).toThrow("Contract must define a route with .route()");
+  });
+});
+
+describe("endpoint types", () => {
+  it("keeps server context readonly and types next context", () => {
+    const bound = endpoint<ServerContext>()
+      .contract(testContract)
+      .use<AuthContext>(async (_req, server, context, next) => {
+        expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
+        expectTypeOf(context).toEqualTypeOf<{}>();
+        // @ts-expect-error Middleware cannot reassign server context fields.
+        server.userName = "changed";
+        // @ts-expect-error Authentication has not added a user yet.
+        context.user;
+        // @ts-expect-error next must receive the declared context fields.
+        next({});
+        // @ts-expect-error The user name must be a string.
+        next({ user: { name: 42 } });
+        return next({ user: { name: server.userName } });
+      })
+      .handler(async (_req, server, context) => {
+        expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
+        expectTypeOf(context.user).toEqualTypeOf<AuthContext["user"]>();
+        // @ts-expect-error Handlers cannot reassign server context fields.
+        server.greeting = "changed";
+        return { status: 200, body: { hello: context.user.name } };
+      });
+
+    expectTypeOf(bound.fetchWithContext).toEqualTypeOf<
+      (request: Request, server: Readonly<ServerContext>) => Promise<Response>
+    >();
+    const request = createRequest();
+    const url = request.url;
+    expectTypeOf(bound.fetchWithContext).toBeCallableWith(
+      request,
+      serverContext,
+    );
+    // @ts-expect-error The server context is required at the request boundary.
+    expectTypeOf(bound.fetchWithContext).toBeCallableWith(request);
+    // @ts-expect-error The server context must supply both configured fields.
+    expectTypeOf(bound.fetchWithContext).toBeCallableWith(request, {});
+    // @ts-expect-error The endpoint accepts a Request, not a URL string.
+    expectTypeOf(bound.fetchWithContext).toBeCallableWith(url, serverContext);
+  });
+
+  it("checks middleware context dependencies", () => {
+    const empty = endpoint<ServerContext>().contract(testContract);
+    // @ts-expect-error authenticate requires traceId in the request context.
+    empty.use(authenticate);
+
+    const wrongTrace = empty.use<{ traceId: number }>(
+      async (_req, _server, _context, next) => next({ traceId: 1 }),
+    );
+    // @ts-expect-error authenticate requires a string traceId.
+    wrongTrace.use(authenticate);
+
+    const optionalTrace = empty.use<{ traceId?: string }>(
+      async (_req, _server, _context, next) => next({}),
+    );
+    // @ts-expect-error authenticate requires traceId to be present.
+    optionalTrace.use(authenticate);
+
+    // @ts-expect-error authenticate adds a string user name, not a number.
+    tracedEndpoint().use<{ user: { name: number } }>(authenticate);
+
+    const missingServer = endpoint<{}>()
+      .contract(testContract)
+      .use<TraceContext>(async (_req, _server, _context, next) =>
+        next({ traceId: "id" }),
+      );
+    // @ts-expect-error authenticate requires userName in server context.
+    missingServer.use(authenticate);
+  });
+
+  it("checks middleware contract requirements", () => {
+    const wrongQueryContract = contract()
+      .route("GET", "/wrong", zodCodec(z.object({})))
+      .query(zodCodec(z.object({ fail: z.string() })))
+      .response(403, authContract.definition.responses[403]);
+    const wrongQuery = endpoint<ServerContext>()
+      .contract(wrongQueryContract)
+      .use<TraceContext>(async (_req, _server, _context, next) =>
+        next({ traceId: "id" }),
+      );
+    // @ts-expect-error authenticate requires a boolean fail query.
+    wrongQuery.use(authenticate);
+
+    const missingResponseContract = contract()
+      .route("GET", "/missing", zodCodec(z.object({})))
+      .query(authContract.definition.query)
+      .response(200, zodCodec(z.string()));
+    const missingResponse = endpoint<ServerContext>()
+      .contract(missingResponseContract)
+      .use<TraceContext>(async (_req, _server, _context, next) =>
+        next({ traceId: "id" }),
+      );
+    // @ts-expect-error authenticate requires a response for status 403.
+    missingResponse.use(authenticate);
+
+    const wrongResponse = endpoint<ServerContext>()
+      .contract(missingResponseContract.response(403, zodCodec(z.number())))
+      .use<TraceContext>(async (_req, _server, _context, next) =>
+        next({ traceId: "id" }),
+      );
+    // @ts-expect-error authenticate returns an error object, not a number.
+    wrongResponse.use(authenticate);
+  });
+
+  it("checks final handler context and responses", () => {
+    const builder = tracedEndpoint().use(authenticate);
+    // @ts-expect-error Status 500 is not in the contract.
+    builder.handler(async () => ({ status: 500, body: { hello: "world" } }));
+    // @ts-expect-error The success response must contain hello.
+    builder.handler(async () => ({ status: 200, body: { error: "wrong" } }));
+    const wrongContextHandler = async (
+      _req: unknown,
+      _server: Readonly<ServerContext>,
+      _context: { user: { name: number } },
+    ) => ({ status: 200 as const, body: { hello: "world" } });
+    // @ts-expect-error The accumulated user name is a string.
+    builder.handler(wrongContextHandler);
+    // @ts-expect-error Direct binding starts with an empty request context.
+    contractHandler(testContract, wrongContextHandler);
+  });
+});
