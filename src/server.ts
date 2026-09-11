@@ -6,6 +6,9 @@ import {
 import {
   composeMiddleware,
   type AddVariables,
+  type InferredMiddlewareHandler,
+  type InferredMiddlewareResult,
+  type InferMiddlewareVariables,
   type MiddlewareChain,
   type MiddlewareHandler,
 } from "./middleware.js";
@@ -86,7 +89,21 @@ export class ServerEndpointBuilder<
     >,
   ) {}
 
-  /** Declare added variables with .use<{ user: User }>(); next merges them in. */
+  /** Infer additions from return next(...), or declare them with .use<Variables>(). */
+  use<const TResult extends InferredMiddlewareResult<TState["responses"]>>(
+    middleware: InferredMiddlewareHandler<
+      TState["params"],
+      TState["query"],
+      TState["request"],
+      TServerEnvironment,
+      TRequestVariables,
+      TResult
+    >,
+  ): ServerEndpointBuilder<
+    TState,
+    TServerEnvironment,
+    AddVariables<TRequestVariables, InferMiddlewareVariables<TResult>>
+  >;
   use<TRequestVariablesNext extends object = {}>(
     middleware: MiddlewareHandler<
       TState["params"],
@@ -97,12 +114,50 @@ export class ServerEndpointBuilder<
       TRequestVariables,
       TRequestVariablesNext
     >,
+  ): ServerEndpointBuilder<
+    TState,
+    TServerEnvironment,
+    AddVariables<TRequestVariables, TRequestVariablesNext>
+  >;
+  use<TRequestVariablesNext extends object = {}>(
+    middleware:
+      | MiddlewareHandler<
+          TState["params"],
+          TState["query"],
+          TState["request"],
+          TState["responses"],
+          TServerEnvironment,
+          TRequestVariables,
+          TRequestVariablesNext
+        >
+      | InferredMiddlewareHandler<
+          TState["params"],
+          TState["query"],
+          TState["request"],
+          TServerEnvironment,
+          TRequestVariables,
+          InferredMiddlewareResult<TState["responses"]>
+        >,
   ) {
     return new ServerEndpointBuilder<
       TState,
       TServerEnvironment,
       AddVariables<TRequestVariables, TRequestVariablesNext>
-    >(this.contract, composeMiddleware(this.compose, middleware));
+    >(
+      this.contract,
+      composeMiddleware(
+        this.compose,
+        middleware as MiddlewareHandler<
+          TState["params"],
+          TState["query"],
+          TState["request"],
+          TState["responses"],
+          TServerEnvironment,
+          TRequestVariables,
+          TRequestVariablesNext
+        >,
+      ),
+    );
   }
 
   handler(
@@ -187,7 +242,7 @@ export function contractHandler<
       req: { ...context.req, headers: context.req.headers ?? new Headers() },
       res: context.res ?? { headers: new Headers() },
       env: context.env,
-      var: {},
+      vars: {},
     });
   }
 

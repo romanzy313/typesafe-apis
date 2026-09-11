@@ -113,7 +113,7 @@ describe("serverEndpoint", () => {
       req: request,
       env: {},
       res: { headers: new Headers() },
-      var: {},
+      vars: {},
     });
     expect(response).toEqual({ status: 200, body: date });
     expect(response.body).toBe(date);
@@ -155,7 +155,7 @@ describe("serverEndpoint", () => {
       },
       env: {},
       res: { headers: new Headers() },
-      var: {},
+      vars: {},
     });
     expect(
       compileContract(c).responses[200].encode,
@@ -299,7 +299,7 @@ describe("serverEndpoint", () => {
       },
       env: {},
       res: { headers: new Headers() },
-      var: {},
+      vars: {},
     });
   });
 
@@ -406,7 +406,7 @@ describe("serverEndpoint types", () => {
     const endpoint = serverEndpoint<{ prefix: string }>()
       .contract(c)
       .use<{ user: string }>(async (context, next) => {
-        expectTypeOf(context.var).toEqualTypeOf<Readonly<{}>>();
+        expectTypeOf(context.vars).toEqualTypeOf<Readonly<{}>>();
         if (false) {
           // @ts-expect-error The request reference is readonly.
           context.req = context.req;
@@ -433,7 +433,7 @@ describe("serverEndpoint types", () => {
           // @ts-expect-error Environment fields are readonly.
           context.env.prefix = "changed";
           // @ts-expect-error Variables are extended through next.
-          context.var = { user: "changed" };
+          context.vars = { user: "changed" };
         }
         context.res.headers.set("x-before", "set");
         return next({ user: "Ada" });
@@ -442,9 +442,9 @@ describe("serverEndpoint types", () => {
         expect([...context.req.headers]).toEqual([]);
         if (false) {
           // @ts-expect-error Established variable fields are readonly.
-          context.var.user = "changed";
+          context.vars.user = "changed";
         }
-        context.res.headers = new Headers({ "x-user": context.var.user });
+        context.res.headers = new Headers({ "x-user": context.vars.user });
         context.res.headers.append("x-test", "set");
         context.res.headers.delete("x-test");
         return {

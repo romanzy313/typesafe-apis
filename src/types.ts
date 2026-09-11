@@ -145,7 +145,7 @@ export type RequestContext<
   readonly req: ServerRequest<TParams, TQuery, TRequestBody>;
   readonly res: { headers: Headers };
   readonly env: Readonly<TServerEnvironment>;
-  readonly var: Readonly<TRequestVariables>;
+  readonly vars: Readonly<TRequestVariables>;
 };
 
 /** Typed calls may omit headers; variables always start empty. */

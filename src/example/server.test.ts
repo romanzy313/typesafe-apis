@@ -1,11 +1,19 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import z from "zod";
-import { compileContract } from "../contract.js";
-import { exampleContract } from "./contract.js";
-import { serverEndpoint } from "../server.js";
-import { exampleHandler } from "./serverHandler.js";
-import type { Codec, RequestContextInput } from "../types.js";
 import { zodCodec } from "../codec.js";
+import { compileContract } from "../contract.js";
+import { serverEndpoint } from "../server.js";
+import type { Codec, RequestContextInput } from "../types.js";
+import { exampleContract } from "./contract.js";
+import {
+  exampleAuthService,
+  type ExampleAuthServiceEnvironment,
+} from "./dependencies.js";
+import { exampleEndpoint } from "./server.js";
+
+const env: ExampleAuthServiceEnvironment = {
+  authService: exampleAuthService(),
+};
 
 function createRequest(
   pathParam = "42",
@@ -16,7 +24,10 @@ function createRequest(
     `https://example.com/test/${pathParam}?queryParam=${queryParam}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer example-user",
+      },
       body: JSON.stringify(body),
     },
   );
@@ -24,11 +35,14 @@ function createRequest(
 
 describe("example", () => {
   it("serves the successful JSON response using the shared contract", async () => {
-    const response = await exampleHandler.fetchWithContext(createRequest(), {});
+    const response = await exampleEndpoint.fetchWithContext(
+      createRequest(),
+      env,
+    );
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
-      hi: "Hello",
+      userId: "example-user",
       pathParam: 42,
       queryParam: "a",
       requestParam: true,
@@ -36,13 +50,14 @@ describe("example", () => {
   });
 
   it("returns a typed business error without HTTP serialization", async () => {
-    const response = await exampleHandler.handle({
+    const response = await exampleEndpoint.handle({
       req: {
         params: { pathParam: 42 },
         query: { queryParam: "b" },
         body: { requestParam: false },
+        headers: new Headers({ authorization: "Bearer example-user" }),
       },
-      env: {},
+      env,
     });
 
     expect(response).toEqual({
@@ -79,7 +94,7 @@ describe("example", () => {
     },
   ])("rejects invalid $name values", async ({ path, query, body }) => {
     await expect(
-      exampleHandler.fetchWithContext(createRequest(path, query, body), {}),
+      exampleEndpoint.fetchWithContext(createRequest(path, query, body), env),
     ).rejects.toBeInstanceOf(z.ZodError);
   });
 
@@ -116,21 +131,21 @@ describe("example types", () => {
   });
 
   it("infers handler arguments and the complete response union", () => {
-    expectTypeOf(exampleHandler.handle)
+    expectTypeOf(exampleEndpoint.handle)
       .parameter(0)
       .toEqualTypeOf<
         RequestContextInput<
           { pathParam: number },
           { queryParam: "a" | "b" },
           { requestParam: boolean },
-          {}
+          ExampleAuthServiceEnvironment
         >
       >();
-    expectTypeOf(exampleHandler.handle).returns.resolves.toEqualTypeOf<
+    expectTypeOf(exampleEndpoint.handle).returns.resolves.toEqualTypeOf<
       | {
           status: 200;
           body: {
-            hi: string;
+            userId: string;
             pathParam: number;
             queryParam: string;
             requestParam: boolean;
@@ -143,7 +158,7 @@ describe("example types", () => {
 
   it("rejects the original example's missing response field", () => {
     const builder = serverEndpoint().contract(exampleContract);
-    // @ts-expect-error The success body requires hi, not notWorking.
+    // @ts-expect-error The success body requires userId, not notWorking.
     builder.handler(async ({ req }) => ({
       status: 200,
       body: {

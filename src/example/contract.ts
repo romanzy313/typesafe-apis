@@ -1,6 +1,7 @@
 import z from "zod";
 import { contract } from "../contract.js";
 import { zodCodec } from "../codec.js";
+import { exampleAuthContract } from "./middleware.js";
 
 // from
 // https://zod.dev/codecs#useful-codecs
@@ -9,12 +10,8 @@ const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   encode: (num) => num.toString(),
 });
 
-export const auth = contract().response(
-  403,
-  zodCodec(z.object({ error: z.literal("auth_please") })),
-);
-
 const base = contract()
+  .merge(exampleAuthContract)
   .path("/test/")
   .query(
     zodCodec(
@@ -24,7 +21,6 @@ const base = contract()
   .response(400, zodCodec(z.object({ error: z.string() })));
 
 export const exampleContract = base
-  .merge(auth)
   .method("POST")
   .path("/:pathParam", zodCodec(z.object({ pathParam: stringToNumber })))
   .request(zodCodec(z.object({ requestParam: z.boolean() })))
@@ -32,7 +28,7 @@ export const exampleContract = base
     200,
     zodCodec(
       z.object({
-        hi: z.string(),
+        userId: z.string(),
         pathParam: z.number(),
         queryParam: z.string(),
         requestParam: z.boolean(),

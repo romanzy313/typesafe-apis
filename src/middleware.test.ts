@@ -39,7 +39,7 @@ const authenticate = createMiddleware<
   { userName: string },
   TraceVariables,
   AuthVariables
->()(authContract, async ({ req, env: server, var: variables }, next) => {
+>()(authContract, async ({ req, env: server, vars: variables }, next) => {
   expectTypeOf(variables.traceId).toEqualTypeOf<string>();
   if (req.query.fail) {
     return { status: 403, body: { error: "auth_please" } };
@@ -64,6 +64,109 @@ function tracedEndpoint() {
 }
 
 describe("createMiddleware", () => {
+  it("infers factory and inline variable additions without explicit output types", async () => {
+    const auth = createMiddleware<ServerEnvironment>()(
+      authContract,
+      async ({ req, env, vars }, next) => {
+        expectTypeOf(vars).toEqualTypeOf<Readonly<{}>>();
+        if (req.query.fail)
+          return { status: 403, body: { error: "auth_please" } };
+        return next({ ...vars, userId: env.userName });
+      },
+    );
+    const bound = serverEndpoint<ServerEnvironment>()
+      .contract(testContract)
+      .use(auth)
+      .use((context, next) => {
+        expectTypeOf(context.vars.userId).toEqualTypeOf<string>();
+        // @ts-expect-error The previous middleware has not added requestId.
+        expectTypeOf(context.vars.requestId);
+        return next({ ...context.vars, requestId: context.req.params.id });
+      })
+      .use(async (context, next) => {
+        expectTypeOf(context.vars.userId).toEqualTypeOf<string>();
+        expectTypeOf(context.vars.requestId).toEqualTypeOf<number>();
+        const response = await next({ label: "inline" });
+        context.res.headers.set("x-status", String(response.status));
+        return response;
+      })
+      .handler(async ({ vars }) => {
+        expectTypeOf(vars.userId).toEqualTypeOf<string>();
+        expectTypeOf(vars.requestId).toEqualTypeOf<number>();
+        expectTypeOf(vars.label).toEqualTypeOf<string>();
+        if (false) {
+          // @ts-expect-error Inferred variables remain readonly.
+          vars.userId = "changed";
+        }
+        return {
+          status: 200,
+          body: { hello: `${vars.userId}:${vars.requestId}:${vars.label}` },
+        };
+      });
+    const response = await bound.fetchWithContext(createRequest(7), env);
+    expect(await response.json()).toEqual({ hello: "Ada:7:inline" });
+    expect(response.headers.get("x-status")).toBe("200");
+  });
+
+  it("preserves branch-dependent replacements when inferring variables", async () => {
+    const bound = tracedEndpoint()
+      .use((context, next) =>
+        context.req.query.fail ? next({ traceId: 42 }) : next({}),
+      )
+      .handler(async ({ vars }) => {
+        expectTypeOf(vars.traceId).toEqualTypeOf<string | number>();
+        return { status: 200, body: { hello: String(vars.traceId) } };
+      });
+    const [original, changed] = await Promise.all([
+      bound.fetchWithContext(createRequest(7, false), env),
+      bound.fetchWithContext(createRequest(7, true), env),
+    ]);
+    expect(await original.json()).toEqual({ hello: "request-7" });
+    expect(await changed.json()).toEqual({ hello: "42" });
+  });
+
+  it("does not promise fields omitted by a continuation branch", () => {
+    const optionalAuth = createMiddleware()(authContract, (context, next) =>
+      context.req.query.fail ? next({}) : next({ userId: "Ada" }),
+    );
+    serverEndpoint<ServerEnvironment>()
+      .contract(testContract)
+      .use(optionalAuth)
+      .handler(async ({ vars }) => {
+        // @ts-expect-error The userId field is absent on one continuation path.
+        expectTypeOf(vars.userId);
+        if ("userId" in vars) expectTypeOf(vars.userId).toEqualTypeOf<string>();
+        return { status: 200, body: { hello: "world" } };
+      });
+  });
+
+  it("checks inline error responses while inferring successful additions", async () => {
+    const base = serverEndpoint<ServerEnvironment>().contract(testContract);
+    const bound = base
+      .use(async (context, next) => {
+        if (context.req.query.fail)
+          return { status: 403, body: { error: "auth_please" } };
+        return next({ userId: context.env.userName });
+      })
+      .handler(async ({ vars }) => ({
+        status: 200,
+        body: { hello: vars.userId },
+      }));
+    const response = await bound.fetchWithContext(createRequest(7, true), env);
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ error: "auth_please" });
+    // @ts-expect-error An inferred callback must return a declared status and body.
+    base.use(async (_context, _next) => ({
+      status: 500,
+      body: { error: "failed" },
+    }));
+    // @ts-expect-error The auth response literal is checked for inferred callbacks.
+    base.use(async (_context, _next) => ({
+      status: 403,
+      body: { error: "other" },
+    }));
+  });
+
   it("keeps an explicit absent-body requirement distinct from an omitted one", async () => {
     const requirements = contract().request(zodCodec(z.undefined()));
     const middleware = createMiddleware()(
@@ -99,7 +202,7 @@ describe("createMiddleware", () => {
       ServerEnvironment,
       TraceVariables,
       AuthVariables
-    >()(testContract, async ({ req, env: server, var: variables }, next) => {
+    >()(testContract, async ({ req, env: server, vars: variables }, next) => {
       expectTypeOf(req).toEqualTypeOf<
         ServerRequest<{ id: number }, { fail: boolean }, { name: string }>
       >();
@@ -126,7 +229,7 @@ describe("createMiddleware", () => {
   it("allows middleware without request or response requirements", async () => {
     const middleware = createMiddleware()(
       contract(),
-      async ({ req, env: server, var: variables }, next) => {
+      async ({ req, env: server, vars: variables }, next) => {
         expectTypeOf(req).toEqualTypeOf<
           ServerRequest<unknown, unknown, unknown>
         >();
@@ -211,14 +314,14 @@ describe("middleware composition", () => {
       .use<{ headers: string }>(async (context, next) => {
         expect(context.res).toBe(res);
         const response = await next({ headers: "variable" });
-        expect(context.var).toEqual({});
+        expect(context.vars).toEqual({});
         expect(context.res.headers.get("x-variable")).toBe("variable");
         return response;
       })
       .handler(async (context) => {
-        expect(context.var.headers).toBe("variable");
+        expect(context.vars.headers).toBe("variable");
         expect(context.res).toBe(res);
-        context.res.headers.set("x-variable", context.var.headers);
+        context.res.headers.set("x-variable", context.vars.headers);
         return { status: 200, body: { hello: context.env.greeting } };
       });
     await expect(
@@ -247,7 +350,7 @@ describe("middleware composition", () => {
           return response;
         })
         .use(authenticate)
-        .handler(async ({ var: variables, res }) => {
+        .handler(async ({ vars: variables, res }) => {
           res.headers.set("x-user", variables.user.name);
           return { status: 200, body: { hello: variables.user.name } };
         });
@@ -321,7 +424,7 @@ describe("middleware composition", () => {
       const handlerCalled = vi.fn();
       const bound = tracedEndpoint()
         .use(authenticate)
-        .handler(async ({ req, env: server, var: variables }) => {
+        .handler(async ({ req, env: server, vars: variables }) => {
           handlerCalled();
           expect(server).toBe(env);
           expect(variables.traceId).toBe("request-7");
@@ -357,7 +460,7 @@ describe("middleware composition", () => {
     const bound = serverEndpoint<ServerEnvironment>()
       .contract(testContract)
       .use<TraceVariables>(
-        async ({ req, env: server, var: variables }, next) => {
+        async ({ req, env: server, vars: variables }, next) => {
           expect(variables).toEqual({});
           expect(server).toBe(env);
           expect(req).toEqual({
@@ -373,7 +476,7 @@ describe("middleware composition", () => {
         },
       )
       .use(authenticate)
-      .use(async ({ var: variables }, next) => {
+      .use(async ({ vars: variables }, next) => {
         expect(variables).toEqual({
           traceId: "request-7",
           user: { name: "Ada" },
@@ -383,7 +486,7 @@ describe("middleware composition", () => {
         order.push("inner after");
         return response;
       })
-      .handler(async ({ req, env: server, var: variables }) => {
+      .handler(async ({ req, env: server, vars: variables }) => {
         expectTypeOf(req.params.id).toEqualTypeOf<number>();
         expectTypeOf(req.query.fail).toEqualTypeOf<boolean>();
         expectTypeOf(variables.traceId).toEqualTypeOf<string>();
@@ -465,7 +568,7 @@ describe("middleware composition", () => {
         next({ traceId: req.params.slug }),
       )
       .use(authenticate)
-      .handler(async ({ req, var: variables }) => ({
+      .handler(async ({ req, vars: variables }) => ({
         status: 201,
         body: {
           location: `${req.query.locale}/${variables.user.name}/${variables.traceId}`,
@@ -484,10 +587,10 @@ describe("middleware composition", () => {
   it("branches chains and replaces request variables fields", async () => {
     const base = tracedEndpoint().use(authenticate);
     const replaced = base
-      .use<{ traceId: number }>(async ({ var: variables }, next) =>
+      .use<{ traceId: number }>(async ({ vars: variables }, next) =>
         next({ traceId: variables.traceId.length }),
       )
-      .handler(async ({ var: variables }) => {
+      .handler(async ({ vars: variables }) => {
         expectTypeOf(variables.traceId).toEqualTypeOf<number>();
         expectTypeOf(variables.user).toEqualTypeOf<AuthVariables["user"]>();
         return {
@@ -495,7 +598,7 @@ describe("middleware composition", () => {
           body: { hello: `${variables.user.name}:${variables.traceId}` },
         };
       });
-    const original = base.handler(async ({ var: variables }) => {
+    const original = base.handler(async ({ vars: variables }) => {
       expectTypeOf(variables.traceId).toEqualTypeOf<string>();
       return {
         status: 200,
@@ -517,7 +620,7 @@ describe("middleware composition", () => {
       .use<{ traceId?: number }>(async ({ req }, next) =>
         next(req.query.fail ? { traceId: 42 } : {}),
       )
-      .handler(async ({ var: variables }) => {
+      .handler(async ({ vars: variables }) => {
         expectTypeOf(variables.traceId).toEqualTypeOf<string | number>();
         return { status: 200, body: { hello: String(variables.traceId) } };
       });
@@ -537,7 +640,7 @@ describe("middleware composition", () => {
     const bound = serverEndpoint<ServerEnvironment>()
       .contract(testContract)
       .use<{ requestId: number }>(
-        async ({ req, env: server, var: variables, res }, next) => {
+        async ({ req, env: server, vars: variables, res }, next) => {
           expect(variables).toEqual({});
           expect(server).toBe(env);
           res.headers.set("x-request-id", String(req.params.id));
@@ -547,7 +650,7 @@ describe("middleware composition", () => {
           return next({ requestId: req.params.id });
         },
       )
-      .handler(async ({ env: server, var: variables }) => {
+      .handler(async ({ env: server, vars: variables }) => {
         await Promise.resolve();
         return {
           status: 200,
@@ -586,7 +689,7 @@ describe("middleware composition", () => {
       async ({
         req,
         env: server,
-        var: variables,
+        vars: variables,
       }: RequestContext<
         { id: number },
         { fail: boolean },
@@ -711,7 +814,7 @@ describe("middleware types", () => {
   it("keeps server environment readonly and types next variables", () => {
     const bound = serverEndpoint<ServerEnvironment>()
       .contract(testContract)
-      .use<AuthVariables>(async ({ env: server, var: variables }, next) => {
+      .use<AuthVariables>(async ({ env: server, vars: variables }, next) => {
         expectTypeOf(server).toEqualTypeOf<Readonly<ServerEnvironment>>();
         expectTypeOf(variables).toEqualTypeOf<Readonly<{}>>();
         // @ts-expect-error Middleware cannot reassign server environment fields.
@@ -726,7 +829,7 @@ describe("middleware types", () => {
         next({ user: { name: "Ada" }, headers: "invalid" });
         return next({ user: { name: server.userName } });
       })
-      .handler(async ({ env: server, var: variables }) => {
+      .handler(async ({ env: server, vars: variables }) => {
         expectTypeOf(server).toEqualTypeOf<Readonly<ServerEnvironment>>();
         expectTypeOf(variables.user).toEqualTypeOf<AuthVariables["user"]>();
         // @ts-expect-error Handlers cannot reassign server environment fields.
@@ -851,7 +954,7 @@ describe("middleware types", () => {
     // @ts-expect-error The success response must contain hello.
     builder.handler(async () => ({ status: 200, body: { error: "wrong" } }));
     const wrongContextHandler = async (_context: {
-      var: { user: { name: number } };
+      vars: { user: { name: number } };
     }) => ({ status: 200 as const, body: { hello: "world" } });
     // @ts-expect-error The accumulated user name is a string.
     builder.handler(wrongContextHandler);

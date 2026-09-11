@@ -1,161 +1,179 @@
-import { assert, describe, expect, expectTypeOf, it } from "vitest";
+import { assert, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createClient, type ClientResponse } from "../client.js";
-import { serverEndpoint } from "../server.js";
 import type { ContractResponse } from "../types.js";
 import { exampleContract } from "./contract.js";
-import { exampleHandler } from "./serverHandler.js";
+import { exampleAuthService, type ServerEnvironment } from "./dependencies.js";
+import { exampleEndpoint, exampleUsage } from "./server.js";
+
+const input = {
+  params: { pathParam: 42.5 },
+  query: { queryParam: "b" as const },
+  body: { requestParam: true },
+};
+
+function createExampleClient(env: ServerEnvironment) {
+  return createClient({
+    baseUrl: "https://example.com",
+    fetch: (request) => exampleEndpoint.fetchWithContext(request, env),
+  }).contract(exampleContract);
+}
 
 describe("example end-to-end", () => {
-  it.each([false, true])(
-    "passes HTTP headers through the request context with auth=%s",
-    async (authenticated) => {
-      const endpoint = serverEndpoint<{ token: string }>()
-        .contract(exampleContract)
-        .use<{ authenticated: true }>(async (context, next) => {
-          context.res.headers.set(
-            "x-request-id",
-            context.req.headers.get("x-request-id")!,
-          );
-          if (context.req.headers.get("authorization") !== context.env.token) {
-            return { status: 403, body: { error: "auth_please" } };
-          }
-          const response = await next({ authenticated: true });
-          context.res.headers.set("x-after", "set");
-          return response;
-        })
-        .handler(async (context) => {
-          expectTypeOf(context.var.authenticated).toEqualTypeOf<true>();
-          expect(context.var.authenticated).toBe(true);
-          context.res.headers.set("x-handler", "set");
-          return exampleHandler.handle(context);
-        });
-      const call = createClient({
-        baseUrl: "https://example.com",
-        fetch: (request) =>
-          endpoint.fetchWithContext(request, { token: "Bearer example" }),
-      }).contract(exampleContract);
-      const headers = {
-        authorization: authenticated ? "Bearer example" : "invalid",
-        "x-request-id": "request-1",
-      };
-      const response = await call(
-        {
-          params: { pathParam: 42 },
-          query: { queryParam: "a" },
-          body: { requestParam: true },
-        },
-        { headers },
-      );
-      expect(response.status).toBe(authenticated ? 200 : 403);
-      expect(response.headers.get("x-request-id")).toBe("request-1");
-      expect(response.headers.get("x-handler")).toBe(
-        authenticated ? "set" : null,
-      );
-      expect(response.headers.get("x-after")).toBe(
-        authenticated ? "set" : null,
-      );
-      expect(response.headers.has("authorization")).toBe(false);
-      expect(headers).toEqual({
-        authorization: authenticated ? "Bearer example" : "invalid",
-        "x-request-id": "request-1",
-      });
-    },
-  );
-
-  it("round-trips the auth response from the merged contract", async () => {
-    const endpoint = serverEndpoint()
-      .contract(exampleContract)
-      .handler(async () => ({ status: 403, body: { error: "auth_please" } }));
-    const fetchExample = createClient({
-      baseUrl: "https://example.com",
-      fetch: (request) => endpoint.fetchWithContext(request, {}),
-    }).contract(exampleContract);
-
-    const response = await fetchExample({
-      params: { pathParam: 42 },
-      query: { queryParam: "a" },
-      body: { requestParam: true },
+  it("runs the standalone server usage demonstration", async () => {
+    const response = await exampleUsage();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      userId: "example-user",
+      pathParam: 42,
+      queryParam: "a",
+      requestParam: true,
     });
-
-    expect(response).toEqual({
-      headers: expect.any(Headers),
-      status: 403,
-      body: { error: "auth_please" },
-    });
-    if (response.status === 403) {
-      expectTypeOf(response.body).toEqualTypeOf<
-        Readonly<{ error: "auth_please" }>
-      >();
-    }
   });
 
-  it("round-trips a typed request through HTTP JSON and the server handler", async () => {
+  it("round-trips the example contract through auth, inline middleware, and the handler", async () => {
+    const authService = exampleAuthService();
+    const lookup = vi
+      .spyOn(authService, "getUserIdByBearer")
+      .mockResolvedValue("resolved-user");
     const expectedBody = {
-      hi: "Hello",
+      userId: "resolved-user",
       pathParam: 42.5,
       queryParam: "b",
       requestParam: true,
     };
-    const fetchExample = createClient({
+    const call = createClient({
       baseUrl: "https://example.com",
       fetch: async (request) => {
         assert(request instanceof Request);
         expect(request.method).toBe("POST");
         expect(request.url).toBe("https://example.com/test/42.5?queryParam=b");
+        expect(request.headers.get("authorization")).toBe(
+          "Bearer example-token",
+        );
         expect(request.headers.get("content-type")).toBe("application/json");
         expect(await request.clone().json()).toEqual({ requestParam: true });
-
-        const response = await exampleHandler.fetchWithContext(request, {});
-
+        const response = await exampleEndpoint.fetchWithContext(request, {
+          authService,
+        });
         expect(response.status).toBe(200);
-        expect(response.headers.get("content-type")).toBe("application/json");
         expect(await response.clone().json()).toEqual(expectedBody);
         return response;
       },
     }).contract(exampleContract);
-
-    expectTypeOf(fetchExample).returns.resolves.toEqualTypeOf<
+    expectTypeOf(call).returns.resolves.toEqualTypeOf<
       ClientResponse<
-        ContractResponse<typeof exampleHandler.definition.responses>
+        ContractResponse<typeof exampleEndpoint.definition.responses>
       >
     >();
 
-    const response = await fetchExample({
-      params: { pathParam: 42.5 },
-      query: { queryParam: "b" },
-      body: { requestParam: true },
-    });
-
+    const headers = { authorization: "Bearer example-token" };
+    const response = await call(input, { headers });
     expect(response).toEqual({
-      headers: expect.any(Headers),
       status: 200,
       body: expectedBody,
+      headers: expect.any(Headers),
     });
+    expect(lookup).toHaveBeenCalledExactlyOnceWith("example-token");
+    expect(response.headers.get("x-request-id")).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(response.headers.has("authorization")).toBe(false);
+    expect(headers).toEqual({ authorization: "Bearer example-token" });
     if (response.status === 200) {
+      expectTypeOf(response.body.userId).toEqualTypeOf<string>();
       expectTypeOf(response.body.pathParam).toEqualTypeOf<number>();
-      expectTypeOf(response.body.requestParam).toEqualTypeOf<boolean>();
     }
   });
 
-  it("returns the server's declared business error through the client", async () => {
-    const fetchExample = createClient({
-      baseUrl: "https://example.com",
-      fetch: (request) => exampleHandler.fetchWithContext(request, {}),
-    }).contract(exampleContract);
+  it.each([
+    { authorization: undefined, bearer: undefined },
+    { authorization: "", bearer: undefined },
+    { authorization: "Basic example-user", bearer: undefined },
+    { authorization: "Bearer", bearer: undefined },
+    { authorization: "Bearer user extra", bearer: undefined },
+    { authorization: "Bearer ", bearer: undefined },
+    { authorization: "Bearer fail", bearer: "fail" },
+  ])(
+    "returns auth_please for authorization=$authorization",
+    async ({ authorization, bearer }) => {
+      const authService = exampleAuthService();
+      const lookup = vi.spyOn(authService, "getUserIdByBearer");
+      const call = createExampleClient({ authService });
+      const response = await call(input, {
+        headers: authorization === undefined ? {} : { authorization },
+      });
+      expect(response).toEqual({
+        status: 403,
+        body: { error: "auth_please" },
+        headers: expect.any(Headers),
+      });
+      expect(response.headers.has("x-request-id")).toBe(false);
+      if (bearer === undefined) expect(lookup).not.toHaveBeenCalled();
+      else expect(lookup).toHaveBeenCalledExactlyOnceWith(bearer);
+      if (response.status === 403) {
+        expectTypeOf(response.body).toEqualTypeOf<
+          Readonly<{ error: "auth_please" }>
+        >();
+      }
+    },
+  );
 
-    const response = await fetchExample({
-      params: { pathParam: 42 },
-      query: { queryParam: "a" },
-      body: { requestParam: false },
-    });
-
+  it("returns a business error after authentication and preserves the request ID", async () => {
+    const call = createExampleClient({ authService: exampleAuthService() });
+    const response = await call(
+      { ...input, body: { requestParam: false } },
+      {
+        headers: { authorization: "Bearer example-user" },
+      },
+    );
     expect(response).toEqual({
-      headers: expect.any(Headers),
       status: 400,
       body: { error: "requestParam must be true" },
+      headers: expect.any(Headers),
     });
+    expect(response.headers.get("x-request-id")).toBeTypeOf("string");
     if (response.status === 400) {
       expectTypeOf(response.body).toEqualTypeOf<Readonly<{ error: string }>>();
     }
+  });
+
+  it("isolates authentication variables and request IDs across concurrent requests", async () => {
+    const call = createExampleClient({ authService: exampleAuthService() });
+    const responses = await Promise.all(
+      ["first-user", "second-user"].map((userId) =>
+        call(input, { headers: { authorization: `Bearer ${userId}` } }),
+      ),
+    );
+    expect(responses.map((response) => response.body)).toEqual([
+      {
+        userId: "first-user",
+        pathParam: 42.5,
+        queryParam: "b",
+        requestParam: true,
+      },
+      {
+        userId: "second-user",
+        pathParam: 42.5,
+        queryParam: "b",
+        requestParam: true,
+      },
+    ]);
+    const requestIds = responses.map((response) =>
+      response.headers.get("x-request-id"),
+    );
+    expect(requestIds.every((requestId) => typeof requestId === "string")).toBe(
+      true,
+    );
+    expect(new Set(requestIds).size).toBe(2);
+  });
+
+  it("propagates authentication service failures", async () => {
+    const error = new Error("Authentication service unavailable");
+    const authService = exampleAuthService();
+    vi.spyOn(authService, "getUserIdByBearer").mockRejectedValue(error);
+    const call = createExampleClient({ authService });
+    await expect(
+      call(input, { headers: { authorization: "Bearer example-user" } }),
+    ).rejects.toBe(error);
   });
 });

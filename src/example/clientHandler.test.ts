@@ -1,18 +1,24 @@
 import { describe, expectTypeOf, it } from "vitest";
 import { createClient, type ClientResponse } from "../client.js";
-// import type { exampleFetch } from "./clientHandler.js";
+import { exampleFetch } from "./clientHandler.js";
 import { exampleContract } from "./contract.js";
-import { exampleHandler } from "./serverHandler.js";
+import { exampleEndpoint } from "./server.js";
+import {
+  exampleAuthService,
+  type ExampleAuthServiceEnvironment,
+} from "./dependencies.js";
+
+const env: ExampleAuthServiceEnvironment = {
+  authService: exampleAuthService(),
+};
 
 const fetchExample = createClient({
   baseUrl: "https://example.com",
-  fetch: (request) => exampleHandler.fetchWithContext(request, {}),
+  fetch: (request) => exampleEndpoint.fetchWithContext(request, env),
 }).contract(exampleContract);
 
 describe("example client types", () => {
   it("infers request and response types for the exported client", () => {
-    const exampleFetch = createClient().contract(exampleContract);
-
     expectTypeOf<typeof exampleFetch>().toEqualTypeOf<typeof fetchExample>();
     expectTypeOf(fetchExample).parameter(0).toEqualTypeOf<{
       params: { pathParam: number };
@@ -24,7 +30,7 @@ describe("example client types", () => {
         | {
             status: 200;
             body: {
-              hi: string;
+              userId: string;
               pathParam: number;
               queryParam: string;
               requestParam: boolean;
