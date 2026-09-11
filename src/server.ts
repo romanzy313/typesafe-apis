@@ -18,7 +18,7 @@ import type {
   RequestMethod,
   ResponseCodecs,
   ResponseExtract,
-  TypedRequest,
+  ValidRequest,
 } from "./types.js";
 
 export type ServerEndpoint<
@@ -38,7 +38,7 @@ export type ServerEndpoint<
   >;
   /** Run middleware and the handler on decoded values. */
   handle(
-    request: TypedRequest<TParams, TQuery, TRequestBody>,
+    request: ValidRequest<TParams, TQuery, TRequestBody>,
     serverContext: Readonly<TServerContext>,
     requestContext?: RequestContext,
   ): Promise<ContractResponse<NoInfer<TResponses>>>;
@@ -56,7 +56,7 @@ export type EndpointHandler<
   TServerContext,
   TRequestContext extends object,
 > = (
-  req: NoInfer<TypedRequest<TParams, TQuery, TRequestBody>>,
+  req: NoInfer<ValidRequest<TParams, TQuery, TRequestBody>>,
   serverContext: Readonly<TServerContext>,
   requestContext: RequestContext & TRequestContext,
 ) => Promise<ContractResponse<NoInfer<TResponses>>>;
@@ -168,11 +168,15 @@ export function contractHandler<
   }
 
   async function handle(
-    request: TypedRequest<TState["params"], TState["query"], TState["request"]>,
+    validRequest: ValidRequest<
+      TState["params"],
+      TState["query"],
+      TState["request"]
+    >,
     serverContext: Readonly<TServerContext>,
     requestContext: RequestContext = { headers: new Headers() },
   ): Promise<ContractResponse<NoInfer<TState["responses"]>>> {
-    return handler(request, serverContext, requestContext);
+    return handler(validRequest, serverContext, requestContext);
   }
 
   async function fetchWithContext(

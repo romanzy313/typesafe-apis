@@ -6,7 +6,7 @@ import type {
   RequestMethod,
   ResponseCodecs,
   StatusCode,
-  TypedRequest,
+  ValidRequest,
 } from "./types.js";
 
 export type ContractState = {
@@ -127,7 +127,7 @@ type Configuration = {
 const configuration = Symbol("contract configuration");
 declare const contractTypes: unique symbol;
 
-export type InferRequest<TBuilder extends ContractBuilder> = TypedRequest<
+export type InferRequest<TBuilder extends ContractBuilder> = ValidRequest<
   TBuilder[typeof contractTypes]["params"],
   TBuilder[typeof contractTypes]["query"],
   TBuilder[typeof contractTypes]["request"]

@@ -5,8 +5,8 @@ import type {
   RequestContext,
   ResponseCodecs,
   StatusCode,
-  TypedRequest,
-  TypedResponse,
+  ValidRequest,
+  ValidResponse,
 } from "./types.js";
 
 declare const middlewareResponses: unique symbol;
@@ -21,8 +21,8 @@ export type MiddlewareHandler<
   TRequestContext extends object,
   TRequestContextNext extends object,
 > = {
-  <TNextResponse extends TypedResponse<StatusCode, unknown>>(
-    req: TypedRequest<TParams, TQuery, TRequestBody>,
+  <TNextResponse extends ValidResponse<StatusCode, unknown>>(
+    req: ValidRequest<TParams, TQuery, TRequestBody>,
     serverContext: Readonly<TServerContext>,
     requestContext: RequestContext & TRequestContext,
     next: (
@@ -72,8 +72,7 @@ type OptionalKeys<T> = {
 
 type OptionalContext<TCurrent, TNext> = {
   [TKey in keyof TCurrent]:
-    | TCurrent[TKey]
-    | Required<TNext>[TKey & keyof TNext];
+    TCurrent[TKey] | Required<TNext>[TKey & keyof TNext];
 };
 
 // Optional updates can be absent, so overlapping fields retain their old type.

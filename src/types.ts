@@ -107,7 +107,7 @@ export type RequestExtract = {
   headers: Readonly<Headers>;
 };
 
-export type TypedRequest<TParams, TQuery, TRequestBody> = {
+export type ValidRequest<TParams, TQuery, TRequestBody> = {
   params: TParams;
   query: TQuery;
   body: TRequestBody;
@@ -125,13 +125,13 @@ export type ResponseExtract = {
   headers: Headers;
 };
 
-export type TypedResponse<TStatus extends StatusCode, TResponseBody> = {
+export type ValidResponse<TStatus extends StatusCode, TResponseBody> = {
   status: TStatus;
   body: TResponseBody;
 };
 
 export type ContractResponse<TResponses extends ResponseCodecs> = {
-  [TStatus in keyof TResponses & StatusCode]: TypedResponse<
+  [TStatus in keyof TResponses & StatusCode]: ValidResponse<
     TStatus,
     ReturnType<NonNullable<TResponses[TStatus]>["decode"]>
   >;

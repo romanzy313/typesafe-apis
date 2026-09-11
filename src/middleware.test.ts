@@ -5,7 +5,7 @@ import { zodCodec } from "./codec.js";
 import { compileContract, contract, type InferResponses } from "./contract.js";
 import { createMiddleware, type MiddlewareHandler } from "./middleware.js";
 import { contractHandler, serverEndpoint } from "./server.js";
-import type { RequestContext, TypedRequest } from "./types.js";
+import type { RequestContext, ValidRequest } from "./types.js";
 
 const stringToNumber = z.codec(z.string(), z.number(), {
   decode: Number,
@@ -97,7 +97,7 @@ describe("createMiddleware", () => {
       AuthContext
     >()(testContract, async (req, server, context, next) => {
       expectTypeOf(req).toEqualTypeOf<
-        TypedRequest<{ id: number }, { fail: boolean }, { name: string }>
+        ValidRequest<{ id: number }, { fail: boolean }, { name: string }>
       >();
       expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
       expectTypeOf(context).toEqualTypeOf<RequestContext & TraceContext>();
@@ -126,7 +126,7 @@ describe("createMiddleware", () => {
       contract(),
       async (req, server, context, next) => {
         expectTypeOf(req).toEqualTypeOf<
-          TypedRequest<unknown, unknown, unknown>
+          ValidRequest<unknown, unknown, unknown>
         >();
         expectTypeOf(server).toEqualTypeOf<Readonly<{}>>();
         expectTypeOf(context).toEqualTypeOf<RequestContext>();
@@ -693,26 +693,26 @@ describe("middleware types", () => {
     expectTypeOf(bound.handle)
       .parameter(1)
       .toEqualTypeOf<Readonly<ServerContext>>();
-    const typedRequest = {
+    const validRequest = {
       params: { id: 7 },
       query: { fail: false },
       body: { name: "world" },
       headers: new Headers(),
     };
-    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext);
-    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext, {
+    expectTypeOf(bound.handle).toBeCallableWith(validRequest, serverContext);
+    expectTypeOf(bound.handle).toBeCallableWith(validRequest, serverContext, {
       headers: new Headers(),
     });
-    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, serverContext, {
+    expectTypeOf(bound.handle).toBeCallableWith(validRequest, serverContext, {
       // @ts-expect-error The base context requires a Headers instance.
       headers: { "x-test": "value" },
     });
     // @ts-expect-error The server context is required for typed requests too.
-    expectTypeOf(bound.handle).toBeCallableWith(typedRequest);
+    expectTypeOf(bound.handle).toBeCallableWith(validRequest);
     // @ts-expect-error The server context must supply both configured fields.
-    expectTypeOf(bound.handle).toBeCallableWith(typedRequest, {});
+    expectTypeOf(bound.handle).toBeCallableWith(validRequest, {});
     expectTypeOf(bound.handle).toBeCallableWith(
-      typedRequest,
+      validRequest,
       serverContext,
       // @ts-expect-error A supplied base context must include headers.
       { user: { name: "injected" } },

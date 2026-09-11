@@ -7,7 +7,7 @@ import {
   serverEndpoint,
   type ServerEndpoint,
 } from "./server.js";
-import type { RequestContext, StatusCode, TypedRequest } from "./types.js";
+import type { RequestContext, StatusCode, ValidRequest } from "./types.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 
@@ -444,7 +444,7 @@ describe("serverEndpoint types", () => {
     const builder = serverEndpoint().contract(c);
     const endpoint = builder.handler(async (req) => {
       expectTypeOf(req).toEqualTypeOf<
-        TypedRequest<
+        ValidRequest<
           { id: number },
           { filter: "a" | "b" },
           { enabled: boolean }
@@ -480,7 +480,7 @@ describe("serverEndpoint types", () => {
     >();
     expectTypeOf(endpoint.handle).parameters.toEqualTypeOf<
       [
-        TypedRequest<
+        ValidRequest<
           { id: number },
           { filter: "a" | "b" },
           { enabled: boolean }
@@ -492,26 +492,26 @@ describe("serverEndpoint types", () => {
     expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
-    const typedRequest: Parameters<typeof endpoint.handle>[0] = {
+    const validRequest: Parameters<typeof endpoint.handle>[0] = {
       params: { id: 42 },
       query: { filter: "a" },
       body: { enabled: true },
       headers: new Headers(),
     };
-    expectTypeOf(endpoint.handle).toBeCallableWith(typedRequest, {});
+    expectTypeOf(endpoint.handle).toBeCallableWith(validRequest, {});
     expectTypeOf(endpoint.handle).toBeCallableWith(
       // @ts-expect-error handle requires decoded numeric parameters.
-      { ...typedRequest, params: { id: "42" } },
+      { ...validRequest, params: { id: "42" } },
       {},
     );
     expectTypeOf(endpoint.handle).toBeCallableWith(
       // @ts-expect-error handle only accepts the declared query values.
-      { ...typedRequest, query: { filter: "c" } },
+      { ...validRequest, query: { filter: "c" } },
       {},
     );
     expectTypeOf(endpoint.handle).toBeCallableWith(
       // @ts-expect-error handle requires the declared request body.
-      { ...typedRequest, body: {} },
+      { ...validRequest, body: {} },
       {},
     );
     expectTypeOf(endpoint.fetchWithContext).toEqualTypeOf<

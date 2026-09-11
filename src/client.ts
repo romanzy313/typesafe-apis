@@ -11,7 +11,7 @@ import type {
   RequestExtract,
   RequestMethod,
   ResponseCodecs,
-  TypedRequest,
+  ValidRequest,
 } from "./types.js";
 
 export type ClientOptions = {
@@ -26,7 +26,7 @@ export type TypesafeFetch<
   TRequestBody,
   TResponses extends ResponseCodecs,
 > = (
-  typedRequest: TypedRequest<TParams, TQuery, TRequestBody>,
+  validRequest: ValidRequest<TParams, TQuery, TRequestBody>,
 ) => Promise<ContractResponse<TResponses>>;
 
 export type Client = {
@@ -87,9 +87,9 @@ export function createClient(opts: ClientOptions = {}): Client {
       }
 
       return async (
-        typedRequest: InferRequest<ContractBuilder<TState>>,
+        validRequest: InferRequest<ContractBuilder<TState>>,
       ): Promise<ContractResponse<TState["responses"]>> => {
-        const encodedRequest = encodeRequest(typedRequest);
+        const encodedRequest = encodeRequest(validRequest);
 
         const request = createJsonRequest(
           encodedRequest,
