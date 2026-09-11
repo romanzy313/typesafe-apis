@@ -1,11 +1,67 @@
 import { assert, describe, expect, expectTypeOf, it } from "vitest";
-import { createClient } from "../client.js";
+import { createClient, type ClientResponse } from "../client.js";
 import { serverEndpoint } from "../server.js";
 import type { ContractResponse } from "../types.js";
 import { exampleContract } from "./contract.js";
 import { exampleHandler } from "./serverHandler.js";
 
 describe("example end-to-end", () => {
+  it.each([false, true])(
+    "passes HTTP headers through the request context with auth=%s",
+    async (authenticated) => {
+      const endpoint = serverEndpoint<{ token: string }>()
+        .contract(exampleContract)
+        .use<{ authenticated: true }>(async (context, next) => {
+          context.res.headers.set(
+            "x-request-id",
+            context.req.headers.get("x-request-id")!,
+          );
+          if (context.req.headers.get("authorization") !== context.env.token) {
+            return { status: 403, body: { error: "auth_please" } };
+          }
+          const response = await next({ authenticated: true });
+          context.res.headers.set("x-after", "set");
+          return response;
+        })
+        .handler(async (context) => {
+          expectTypeOf(context.var.authenticated).toEqualTypeOf<true>();
+          expect(context.var.authenticated).toBe(true);
+          context.res.headers.set("x-handler", "set");
+          return exampleHandler.handle(context);
+        });
+      const call = createClient({
+        baseUrl: "https://example.com",
+        fetch: (request) =>
+          endpoint.fetchWithContext(request, { token: "Bearer example" }),
+      }).contract(exampleContract);
+      const headers = {
+        authorization: authenticated ? "Bearer example" : "invalid",
+        "x-request-id": "request-1",
+      };
+      const response = await call(
+        {
+          params: { pathParam: 42 },
+          query: { queryParam: "a" },
+          body: { requestParam: true },
+        },
+        { headers },
+      );
+      expect(response.status).toBe(authenticated ? 200 : 403);
+      expect(response.headers.get("x-request-id")).toBe("request-1");
+      expect(response.headers.get("x-handler")).toBe(
+        authenticated ? "set" : null,
+      );
+      expect(response.headers.get("x-after")).toBe(
+        authenticated ? "set" : null,
+      );
+      expect(response.headers.has("authorization")).toBe(false);
+      expect(headers).toEqual({
+        authorization: authenticated ? "Bearer example" : "invalid",
+        "x-request-id": "request-1",
+      });
+    },
+  );
+
   it("round-trips the auth response from the merged contract", async () => {
     const endpoint = serverEndpoint()
       .contract(exampleContract)
@@ -19,15 +75,17 @@ describe("example end-to-end", () => {
       params: { pathParam: 42 },
       query: { queryParam: "a" },
       body: { requestParam: true },
-      headers: new Headers(),
     });
 
     expect(response).toEqual({
+      headers: expect.any(Headers),
       status: 403,
       body: { error: "auth_please" },
     });
     if (response.status === 403) {
-      expectTypeOf(response.body).toEqualTypeOf<{ error: "auth_please" }>();
+      expectTypeOf(response.body).toEqualTypeOf<
+        Readonly<{ error: "auth_please" }>
+      >();
     }
   });
 
@@ -57,17 +115,22 @@ describe("example end-to-end", () => {
     }).contract(exampleContract);
 
     expectTypeOf(fetchExample).returns.resolves.toEqualTypeOf<
-      ContractResponse<typeof exampleHandler.definition.responses>
+      ClientResponse<
+        ContractResponse<typeof exampleHandler.definition.responses>
+      >
     >();
 
     const response = await fetchExample({
       params: { pathParam: 42.5 },
       query: { queryParam: "b" },
       body: { requestParam: true },
-      headers: new Headers(),
     });
 
-    expect(response).toEqual({ status: 200, body: expectedBody });
+    expect(response).toEqual({
+      headers: expect.any(Headers),
+      status: 200,
+      body: expectedBody,
+    });
     if (response.status === 200) {
       expectTypeOf(response.body.pathParam).toEqualTypeOf<number>();
       expectTypeOf(response.body.requestParam).toEqualTypeOf<boolean>();
@@ -84,15 +147,15 @@ describe("example end-to-end", () => {
       params: { pathParam: 42 },
       query: { queryParam: "a" },
       body: { requestParam: false },
-      headers: new Headers(),
     });
 
     expect(response).toEqual({
+      headers: expect.any(Headers),
       status: 400,
       body: { error: "requestParam must be true" },
     });
     if (response.status === 400) {
-      expectTypeOf(response.body).toEqualTypeOf<{ error: string }>();
+      expectTypeOf(response.body).toEqualTypeOf<Readonly<{ error: string }>>();
     }
   });
 });

@@ -1,16 +1,16 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
-import { createClient } from "./client.js";
+import { createClient, type ClientResponse } from "./client.js";
 import { zodCodec } from "./codec.js";
 import {
   compileContract,
   contract,
   type InferDefinition,
   type InferRequest,
-  type InferResponses,
 } from "./contract.js";
 import { createMiddleware } from "./middleware.js";
 import { serverEndpoint } from "./server.js";
+import type { ServerRequest } from "./types.js";
 
 const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
   decode: Number,
@@ -64,7 +64,6 @@ describe("contract compilation", () => {
       params: { id: number };
       query: { page: number } & { filter: string };
       body: undefined;
-      headers: Readonly<Headers>;
     }>();
     expect(intersection).toHaveBeenCalledExactlyOnceWith(filter);
     expect(union).toHaveBeenCalledExactlyOnceWith(secondResponse);
@@ -104,10 +103,10 @@ describe("contract compilation", () => {
     const requirements = contract().request(body).response(200, response);
     const middleware = createMiddleware()(
       requirements,
-      async (req, _server, _context, next) => {
+      async ({ req }, next) => {
         expectTypeOf(req.params).toBeUnknown();
         expectTypeOf(req.query).toBeUnknown();
-        expectTypeOf(req.body).toEqualTypeOf<{ name: string }>();
+        expectTypeOf(req.body).toEqualTypeOf<Readonly<{ name: string }>>();
         return next({});
       },
     );
@@ -116,7 +115,7 @@ describe("contract compilation", () => {
     expect(compileBody).not.toHaveBeenCalled();
     expect(compileResponse).not.toHaveBeenCalled();
 
-    const endpoint = pending.handler(async (req) => ({
+    const endpoint = pending.handler(async ({ req }) => ({
       status: 200,
       body: req.body,
     }));
@@ -134,10 +133,10 @@ describe("contract compilation", () => {
       params: {},
       query: {},
       body: { name: "item" },
-      headers: new Headers(),
     };
     for (let index = 0; index < 2; index++) {
       await expect(call(request)).resolves.toEqual({
+        headers: expect.any(Headers),
         status: 200,
         body: request.body,
       });
@@ -146,7 +145,7 @@ describe("contract compilation", () => {
     expect(decodeBody).toHaveBeenCalledTimes(2);
     expect(encodeResponse).toHaveBeenCalledTimes(2);
     expect(decodeResponse).toHaveBeenCalledTimes(2);
-    await expect(endpoint.handle(request, {})).resolves.toEqual({
+    await expect(endpoint.handle({ req: request, env: {} })).resolves.toEqual({
       status: 200,
       body: request.body,
     });
@@ -373,10 +372,12 @@ describe("contract composition", () => {
     });
 
     const builder = serverEndpoint().contract(final);
-    const endpoint = builder.handler(async (req) => {
-      expectTypeOf(req.params).toEqualTypeOf<{ id: number }>();
+    const endpoint = builder.handler(async ({ req }) => {
+      expectTypeOf(req.params).toEqualTypeOf<Readonly<{ id: number }>>();
       expectTypeOf(req.query).toEqualTypeOf<
-        { page: number } & { action: "read" | "forbidden" | "disabled" }
+        Readonly<
+          { page: number } & { action: "read" | "forbidden" | "disabled" }
+        >
       >();
       expectTypeOf(req.body).toBeUndefined();
 
@@ -396,18 +397,19 @@ describe("contract composition", () => {
       fetch: (request) => endpoint.fetchWithContext(request, {}),
     }).contract(final);
 
-    type Handler = Parameters<typeof builder.handler>[0];
-    expectTypeOf(fetchItem).toEqualTypeOf<
-      (req: Parameters<Handler>[0]) => ReturnType<Handler>
-    >();
+    expectTypeOf(fetchItem)
+      .parameter(0)
+      .toEqualTypeOf<InferRequest<typeof final>>();
     expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
-      | { status: 200; body: { id: number; page: number } }
-      | {
-          status: 403;
-          body:
-            | { error: "forbidden" }
-            | { error: "disabled"; data: { id: number } };
-        }
+      ClientResponse<
+        | { status: 200; body: { id: number; page: number } }
+        | {
+            status: 403;
+            body:
+              | { error: "forbidden" }
+              | { error: "disabled"; data: { id: number } };
+          }
+      >
     >();
 
     for (const action of ["read", "forbidden", "disabled"] as const) {
@@ -415,14 +417,22 @@ describe("contract composition", () => {
         params: { id: 42.5 },
         query: { page: 2, action },
         body: undefined,
-        headers: new Headers(),
       });
       if (action === "read") {
-        expect(response).toEqual({ status: 200, body: { id: 42.5, page: 2 } });
+        expect(response).toEqual({
+          headers: expect.any(Headers),
+          status: 200,
+          body: { id: 42.5, page: 2 },
+        });
       } else if (action === "forbidden") {
-        expect(response).toEqual({ status: 403, body: { error: "forbidden" } });
+        expect(response).toEqual({
+          headers: expect.any(Headers),
+          status: 403,
+          body: { error: "forbidden" },
+        });
       } else {
         expect(response).toEqual({
+          headers: expect.any(Headers),
           status: 403,
           body: { error: "disabled", data: { id: 42.5 } },
         });
@@ -432,7 +442,9 @@ describe("contract composition", () => {
         if (response.body.error === "disabled") {
           expectTypeOf(response.body.data).toEqualTypeOf<{ id: number }>();
         } else {
-          expectTypeOf(response.body).toEqualTypeOf<{ error: "forbidden" }>();
+          expectTypeOf(response.body).toEqualTypeOf<
+            Readonly<{ error: "forbidden" }>
+          >();
           // @ts-expect-error Only the disabled variant has data.
           expectTypeOf(response.body.data);
         }
@@ -444,7 +456,6 @@ describe("contract composition", () => {
       // @ts-expect-error The inherited page field is required.
       query: { action: "read" },
       body: undefined,
-      headers: new Headers(),
     });
     // @ts-expect-error The disabled variant requires data.
     builder.handler(async () => ({
@@ -515,12 +526,12 @@ describe("contract composition", () => {
       .method("GET")
       .response(200, zodCodec(z.object({ ok: z.boolean() })));
     const builder = serverEndpoint().contract(c);
-    const endpoint = builder.handler(async (req) => {
+    const endpoint = builder.handler(async ({ req }) => {
       expect(req).toEqual({
+        headers: new Headers(),
         params: {},
         query: {},
         body: undefined,
-        headers: new Headers(),
       });
       return { status: 200, body: { ok: true } };
     });
@@ -537,9 +548,9 @@ describe("contract composition", () => {
         params: {},
         query: {},
         body: undefined,
-        headers: new Headers(),
       }),
     ).resolves.toEqual({
+      headers: expect.any(Headers),
       status: 200,
       body: { ok: true },
     });
@@ -547,14 +558,12 @@ describe("contract composition", () => {
       params: Record<string, never>;
       query: Record<string, never>;
       body: undefined;
-      headers: Readonly<Headers>;
     }>();
     expectTypeOf(fetchEmpty).toBeCallableWith({
       params: {},
       // @ts-expect-error An undeclared query cannot contain fields.
       query: { page: 1 },
       body: undefined,
-      headers: new Headers(),
     });
   });
 
@@ -574,7 +583,7 @@ describe("contract composition", () => {
       { page: string } & { page: number } & { filter: string }
     >();
     const builder = serverEndpoint().contract(c);
-    const endpoint = builder.handler(async (req) => {
+    const endpoint = builder.handler(async ({ req }) => {
       expectTypeOf(req.query.page).toBeNever();
       return { status: 200, body: { ok: true } };
     });
@@ -582,16 +591,14 @@ describe("contract composition", () => {
       fetch: (request) => endpoint.fetchWithContext(request, {}),
     }).contract(c);
 
-    type Handler = Parameters<typeof builder.handler>[0];
-    expectTypeOf(fetchItem).toEqualTypeOf<
-      (req: Parameters<Handler>[0]) => ReturnType<Handler>
-    >();
+    expectTypeOf(fetchItem)
+      .parameter(0)
+      .toEqualTypeOf<InferRequest<typeof c>>();
     expectTypeOf(fetchItem).toBeCallableWith({
       params: { id: 1 },
       // @ts-expect-error The conflicting page field must not disappear.
       query: { filter: "active" },
       body: undefined,
-      headers: new Headers(),
     });
 
     for (const page of ["2", 2]) {
@@ -892,27 +899,29 @@ describe("request composition", () => {
       params: { organization: "one/two ?#%", id: 7.5 },
       query: {},
       body: { expectedVersion: 2, at, name: "item" },
-      headers: new Headers(),
     };
-    const middleware = createMiddleware()(
-      base,
-      async (req, _server, _context, next) => {
-        expectTypeOf(req.params).toEqualTypeOf<{ organization: string }>();
-        expectTypeOf(req.body).toEqualTypeOf<{ expectedVersion: number }>();
-        expect(req.params.organization).toBe(input.params.organization);
-        expect(req.body.expectedVersion).toBe(2);
-        return next({});
-      },
-    );
+    const middleware = createMiddleware()(base, async ({ req }, next) => {
+      expectTypeOf(req.params).toEqualTypeOf<
+        Readonly<{ organization: string }>
+      >();
+      expectTypeOf(req.body).toEqualTypeOf<
+        Readonly<{ expectedVersion: number }>
+      >();
+      expect(req.params.organization).toBe(input.params.organization);
+      expect(req.body.expectedVersion).toBe(2);
+      return next({});
+    });
     const endpoint = serverEndpoint()
       .contract(final)
       .use(middleware)
-      .handler(async (req) => {
+      .handler(async ({ req }) => {
         expectTypeOf(req.params).toEqualTypeOf<
-          { organization: string } & { id: number }
+          Readonly<{ organization: string } & { id: number }>
         >();
         expectTypeOf(req.body).toEqualTypeOf<
-          { expectedVersion: number } & { at: Date } & { name: string }
+          Readonly<
+            { expectedVersion: number } & { at: Date } & { name: string }
+          >
         >();
         expect(req.params).toEqual(input.params);
         expect(req.body).toEqual(input.body);
@@ -936,11 +945,13 @@ describe("request composition", () => {
 
     expectTypeOf(fetchItem)
       .parameter(0)
-      .toEqualTypeOf<Parameters<typeof endpoint.handle>[0]>();
-    expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<{
-      status: 200;
-      body: { name: string; at: Date };
-    }>();
+      .toEqualTypeOf<InferRequest<typeof final>>();
+    expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
+      ClientResponse<{
+        status: 200;
+        body: { name: string; at: Date };
+      }>
+    >();
     expectTypeOf(fetchItem).toBeCallableWith({
       ...input,
       // @ts-expect-error The inherited path parameter is required.
@@ -952,10 +963,11 @@ describe("request composition", () => {
       body: { at, name: "item" },
     });
     await expect(fetchItem(input)).resolves.toEqual({
+      headers: expect.any(Headers),
       status: 200,
       body: { name: "item", at },
     });
-    await expect(endpoint.handle(input, {})).resolves.toEqual({
+    await expect(endpoint.handle({ req: input, env: {} })).resolves.toEqual({
       status: 200,
       body: { name: "item", at },
     });
@@ -989,13 +1001,10 @@ describe("contract merge", () => {
     ]) {
       const endpoint = serverEndpoint()
         .contract(merged)
-        .handler(async (req) => {
-          expectTypeOf(req).toEqualTypeOf<{
-            params: { id: number };
-            query: { page: number };
-            body: { name: string };
-            headers: Readonly<Headers>;
-          }>();
+        .handler(async ({ req }) => {
+          expectTypeOf(req).toEqualTypeOf<
+            ServerRequest<{ id: number }, { page: number }, { name: string }>
+          >();
           expect(req).toEqual({
             params: { id: 7 },
             query: { page: 2 },
@@ -1009,10 +1018,12 @@ describe("contract merge", () => {
         fetch: (request) => endpoint.fetchWithContext(request, {}),
       }).contract(merged);
 
-      expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<{
-        status: 201;
-        body: { created: boolean };
-      }>();
+      expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
+        ClientResponse<{
+          status: 201;
+          body: { created: boolean };
+        }>
+      >();
       expect(compileContract(merged)).toMatchObject({
         method: "POST",
         path: "/items/:id",
@@ -1022,9 +1033,12 @@ describe("contract merge", () => {
           params: { id: 7 },
           query: { page: 2 },
           body: { name: "item" },
-          headers: new Headers(),
         }),
-      ).resolves.toEqual({ status: 201, body: { created: true } });
+      ).resolves.toEqual({
+        status: 201,
+        body: { created: true },
+        headers: expect.any(Headers),
+      });
     }
     expect(empty).not.toHaveProperty("definition");
     expect(compileContract(empty.method("GET")).query.decode({})).toEqual({});

@@ -1,9 +1,9 @@
 import { assert, describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
-import { createClient } from "./client.js";
+import { createClient, type ClientRequestOptions } from "./client.js";
 import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
-import type { MinFetch } from "./types.js";
+import type { MinFetch, ReadonlyHeaders } from "./types.js";
 
 const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
   decode: (value) => new Date(value),
@@ -34,7 +34,6 @@ const input = {
   params: { id: "one" },
   query: { limit: 0, search: "" },
   body: { at: date },
-  headers: new Headers(),
 };
 
 function createTransport() {
@@ -67,15 +66,21 @@ describe("createClient", () => {
       fetch,
     }).contract(itemContract);
 
-    const response = await fetchItem({
-      params: { id: "one/two ?#%" },
-      query: { limit: 0, search: "a & b+c/?#" },
-      body: { at: date },
-      headers,
-    });
+    const response = await fetchItem(
+      {
+        params: { id: "one/two ?#%" },
+        query: { limit: 0, search: "a & b+c/?#" },
+        body: { at: date },
+      },
+      { headers },
+    );
 
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(response).toEqual({ status: 201, body: { createdAt: date } });
+    expect(response).toEqual({
+      headers: expect.any(Headers),
+      status: 201,
+      body: { createdAt: date },
+    });
     expect([...headers]).toEqual([["authorization", "Bearer example-token"]]);
   });
 
@@ -124,12 +129,14 @@ describe("createClient", () => {
         itemResponses.method(method).path("/items/:id", inputs.params),
       );
 
-      await fetchItem({
-        params: input.params,
-        query: {},
-        body: undefined,
-        headers: new Headers({ "x-client": "example" }),
-      });
+      await fetchItem(
+        {
+          params: input.params,
+          query: {},
+          body: undefined,
+        },
+        { headers: { "x-client": "example" } },
+      );
 
       const request = fetch.mock.calls[0]?.[0];
       assert(request instanceof Request);
@@ -168,6 +175,7 @@ describe("createClient", () => {
     }).contract(itemContract);
 
     await expect(fetchItem(input)).resolves.toEqual({
+      headers: expect.any(Headers),
       status: 400,
       body: { error: "Invalid item" },
     });
@@ -183,7 +191,7 @@ describe("createClient", () => {
       fetch,
     }).contract(itemContract);
 
-    await fetchItem({ ...input, headers });
+    await fetchItem(input, { headers });
 
     const request = fetch.mock.calls[0]?.[0];
     assert(request instanceof Request);
@@ -206,13 +214,16 @@ describe("createClient", () => {
     );
 
     await expect(fetchItem(input)).resolves.toEqual({
+      headers: expect.any(Headers),
       status: 204,
       body: undefined,
     });
-    expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<{
-      status: 204;
-      body: undefined;
-    }>();
+    expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
+      {
+        readonly status: 204;
+        readonly body: undefined;
+      } & { readonly headers: ReadonlyHeaders }
+    >();
   });
 
   it.each(["id", "toString"])(
@@ -344,6 +355,60 @@ describe("createClient", () => {
 });
 
 describe("createClient types", () => {
+  it("keeps client input mutable and client output readonly", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      fetch: createTransport(),
+    }).contract(itemContract);
+    const request: Parameters<typeof fetchItem>[0] = {
+      params: { id: "one" },
+      query: { limit: 1, search: "first" },
+      body: { at: date },
+    };
+    request.params.id = "two";
+    request.query.limit = 2;
+    request.body.at = date;
+    request.params = { id: "three" };
+    request.query = { limit: 3, search: "last" };
+    request.body = { at: date };
+    const options: ClientRequestOptions = {};
+    options.headers = new Headers();
+    options.headers.set("x-client", "set");
+    options.headers.append("x-client", "appended");
+    options.headers.delete("x-client");
+
+    const response = await fetchItem(request, options);
+    expect(response.headers.get("content-type")).toBe("application/json");
+    response.headers.forEach((_value, _key, headers) => {
+      expect(headers).toBe(response.headers);
+      if (false) {
+        // @ts-expect-error Iteration cannot expose mutable headers.
+        headers.set("x-test", "changed");
+      }
+    });
+    if (false) {
+      // @ts-expect-error Client response status is readonly.
+      response.status = 201;
+      // @ts-expect-error Client response body is readonly.
+      response.body = { createdAt: date };
+      // @ts-expect-error Client response headers cannot be replaced.
+      response.headers = new Headers();
+      // @ts-expect-error Client response headers expose no set method.
+      response.headers.set("x-test", "changed");
+      // @ts-expect-error Client response headers expose no append method.
+      response.headers.append("x-test", "changed");
+      // @ts-expect-error Client response headers expose no delete method.
+      response.headers.delete("x-test");
+    }
+    if (response.status === 201) {
+      if (false) {
+        // @ts-expect-error Decoded response fields are readonly.
+        response.body.createdAt = date;
+      }
+      expect(response.body.createdAt).toEqual(date);
+    }
+  });
+
   it("infers decoded arguments and the declared response union", () => {
     const fetchItem = createClient({ fetch: createTransport() }).contract(
       itemContract,
@@ -357,18 +422,24 @@ describe("createClient types", () => {
       params: { id: string };
       query: { limit: number; search: string };
       body: { at: Date };
-      headers: Readonly<Headers>;
     }>();
     expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<
-      | { status: 201; body: { createdAt: Date } }
-      | { status: 400; body: { error: string } }
+      (
+        | { readonly status: 201; readonly body: { readonly createdAt: Date } }
+        | { readonly status: 400; readonly body: { readonly error: string } }
+      ) & { readonly headers: ReadonlyHeaders }
     >();
     expectTypeOf(fetchItem).toBeCallableWith(input);
-    expectTypeOf(fetchItem).toBeCallableWith({
-      ...input,
-      // @ts-expect-error Request headers must be a Headers instance.
+    expectTypeOf(fetchItem).toBeCallableWith(input, {
       headers: { authorization: "Bearer example-token" },
     });
+    if (false) {
+      fetchItem({
+        ...input,
+        // @ts-expect-error Headers belong in client options, not valid request data.
+        headers: { authorization: "Bearer example-token" },
+      });
+    }
 
     expectTypeOf(fetchItem).toBeCallableWith({
       ...input,
@@ -389,7 +460,6 @@ describe("createClient types", () => {
     expectTypeOf(fetchItem).toBeCallableWith({
       params: input.params,
       query: input.query,
-      headers: input.headers,
     });
   });
 
@@ -401,9 +471,9 @@ describe("createClient types", () => {
     const response = await fetchItem(input);
 
     if (response.status === 201) {
-      expectTypeOf(response.body).toEqualTypeOf<{ createdAt: Date }>();
+      expectTypeOf(response.body).toEqualTypeOf<{ readonly createdAt: Date }>();
     } else {
-      expectTypeOf(response.body).toEqualTypeOf<{ error: string }>();
+      expectTypeOf(response.body).toEqualTypeOf<{ readonly error: string }>();
     }
   });
 

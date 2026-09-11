@@ -4,7 +4,7 @@ import { compileContract } from "../contract.js";
 import { exampleContract } from "./contract.js";
 import { serverEndpoint } from "../server.js";
 import { exampleHandler } from "./serverHandler.js";
-import type { Codec } from "../types.js";
+import type { Codec, RequestContextInput } from "../types.js";
 import { zodCodec } from "../codec.js";
 
 function createRequest(
@@ -36,15 +36,14 @@ describe("example", () => {
   });
 
   it("returns a typed business error without HTTP serialization", async () => {
-    const response = await exampleHandler.handle(
-      {
+    const response = await exampleHandler.handle({
+      req: {
         params: { pathParam: 42 },
         query: { queryParam: "b" },
         body: { requestParam: false },
-        headers: new Headers(),
       },
-      {},
-    );
+      env: {},
+    });
 
     expect(response).toEqual({
       status: 400,
@@ -117,12 +116,16 @@ describe("example types", () => {
   });
 
   it("infers handler arguments and the complete response union", () => {
-    expectTypeOf(exampleHandler.handle).parameter(0).toEqualTypeOf<{
-      params: { pathParam: number };
-      query: { queryParam: "a" | "b" };
-      body: { requestParam: boolean };
-      headers: Readonly<Headers>;
-    }>();
+    expectTypeOf(exampleHandler.handle)
+      .parameter(0)
+      .toEqualTypeOf<
+        RequestContextInput<
+          { pathParam: number },
+          { queryParam: "a" | "b" },
+          { requestParam: boolean },
+          {}
+        >
+      >();
     expectTypeOf(exampleHandler.handle).returns.resolves.toEqualTypeOf<
       | {
           status: 200;
@@ -141,7 +144,7 @@ describe("example types", () => {
   it("rejects the original example's missing response field", () => {
     const builder = serverEndpoint().contract(exampleContract);
     // @ts-expect-error The success body requires hi, not notWorking.
-    builder.handler(async (req) => ({
+    builder.handler(async ({ req }) => ({
       status: 200,
       body: {
         notWorking: "",

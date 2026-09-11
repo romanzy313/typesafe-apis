@@ -3,7 +3,7 @@ import { exampleContract } from "./contract.js";
 
 export const exampleHandler = serverEndpoint()
   .contract(exampleContract)
-  .handler(async (req) => {
+  .handler(async ({ req }) => {
     if (!req.body.requestParam) {
       return { status: 400, body: { error: "requestParam must be true" } };
     }

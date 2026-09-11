@@ -10,8 +10,12 @@ import type {
   MinFetch,
   RequestExtract,
   RequestMethod,
+  ReadonlyHeaders,
+  ReadonlyValue,
   ResponseCodecs,
+  StatusCode,
   ValidRequest,
+  ValidResponse,
 } from "./types.js";
 
 export type ClientOptions = {
@@ -20,6 +24,19 @@ export type ClientOptions = {
   fetch?: MinFetch;
 };
 
+export type ClientRequestOptions = {
+  headers?: HeadersInit;
+};
+
+export type ClientResponse<
+  TResponse extends ValidResponse<StatusCode, unknown>,
+> =
+  TResponse extends ValidResponse<infer TStatus, infer TBody>
+    ? Readonly<ValidResponse<TStatus, ReadonlyValue<TBody>>> & {
+        readonly headers: ReadonlyHeaders;
+      }
+    : never;
+
 export type TypesafeFetch<
   TParams,
   TQuery,
@@ -27,7 +44,8 @@ export type TypesafeFetch<
   TResponses extends ResponseCodecs,
 > = (
   validRequest: ValidRequest<TParams, TQuery, TRequestBody>,
-) => Promise<ContractResponse<TResponses>>;
+  options?: ClientRequestOptions,
+) => Promise<ClientResponse<ContractResponse<TResponses>>>;
 
 export type Client = {
   contract<TState extends ReadyContractState>(
@@ -57,6 +75,7 @@ export function createClient(opts: ClientOptions = {}): Client {
 
       function encodeRequest(
         req: InferRequest<ContractBuilder<TState>>,
+        options: ClientRequestOptions,
       ): RequestExtract {
         const params = definition.params.encode(req.params);
         assertParams(params);
@@ -67,12 +86,12 @@ export function createClient(opts: ClientOptions = {}): Client {
           params,
           query,
           body: definition.request.encode(req.body),
-          headers: req.headers,
+          headers: new Headers(options.headers),
         };
       }
       function decodeResponse(
         response: Awaited<ReturnType<typeof extractJsonResponse>>,
-      ): ContractResponse<TState["responses"]> {
+      ): ClientResponse<ContractResponse<TState["responses"]>> {
         const codecs: Partial<Record<number, Codec>> = definition.responses;
         const codec = codecs[response.status];
         if (!codec) {
@@ -83,13 +102,15 @@ export function createClient(opts: ClientOptions = {}): Client {
         return {
           status: response.status,
           body: codec.decode(response.body),
-        } as ContractResponse<TState["responses"]>;
+          headers: response.headers,
+        } as unknown as ClientResponse<ContractResponse<TState["responses"]>>;
       }
 
       return async (
         validRequest: InferRequest<ContractBuilder<TState>>,
-      ): Promise<ContractResponse<TState["responses"]>> => {
-        const encodedRequest = encodeRequest(validRequest);
+        options: ClientRequestOptions = {},
+      ): Promise<ClientResponse<ContractResponse<TState["responses"]>>> => {
+        const encodedRequest = encodeRequest(validRequest, options);
 
         const request = createJsonRequest(
           encodedRequest,

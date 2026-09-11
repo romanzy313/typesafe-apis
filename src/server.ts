@@ -5,7 +5,7 @@ import {
 } from "./contract.js";
 import {
   composeMiddleware,
-  type AddContext,
+  type AddVariables,
   type MiddlewareChain,
   type MiddlewareHandler,
 } from "./middleware.js";
@@ -14,11 +14,12 @@ import type {
   ContractDefinition,
   ContractResponse,
   RequestContext,
+  RequestContextInput,
   RequestExtract,
   RequestMethod,
   ResponseCodecs,
   ResponseExtract,
-  ValidRequest,
+  ServerRequest,
 } from "./types.js";
 
 export type ServerEndpoint<
@@ -26,7 +27,7 @@ export type ServerEndpoint<
   TQuery,
   TRequestBody,
   TResponses extends ResponseCodecs,
-  TServerContext,
+  TServerEnvironment,
   TMethod extends RequestMethod = RequestMethod,
 > = {
   definition: ContractDefinition<
@@ -38,13 +39,16 @@ export type ServerEndpoint<
   >;
   /** Run middleware and the handler on decoded values. */
   handle(
-    request: ValidRequest<TParams, TQuery, TRequestBody>,
-    serverContext: Readonly<TServerContext>,
-    requestContext?: RequestContext,
+    context: RequestContextInput<
+      TParams,
+      TQuery,
+      TRequestBody,
+      TServerEnvironment
+    >,
   ): Promise<ContractResponse<NoInfer<TResponses>>>;
   fetchWithContext(
     request: Request,
-    serverContext: Readonly<TServerContext>,
+    env: Readonly<TServerEnvironment>,
   ): Promise<Response>;
 };
 
@@ -53,18 +57,22 @@ export type EndpointHandler<
   TQuery,
   TRequestBody,
   TResponses extends ResponseCodecs,
-  TServerContext,
-  TRequestContext extends object,
+  TServerEnvironment,
+  TRequestVariables extends object,
 > = (
-  req: NoInfer<ValidRequest<TParams, TQuery, TRequestBody>>,
-  serverContext: Readonly<TServerContext>,
-  requestContext: RequestContext & TRequestContext,
+  context: RequestContext<
+    NoInfer<TParams>,
+    NoInfer<TQuery>,
+    NoInfer<TRequestBody>,
+    TServerEnvironment,
+    TRequestVariables
+  >,
 ) => Promise<ContractResponse<NoInfer<TResponses>>>;
 
 export class ServerEndpointBuilder<
   TState extends ReadyContractState,
-  TServerContext,
-  TRequestContext extends object,
+  TServerEnvironment,
+  TRequestVariables extends object,
 > {
   constructor(
     readonly contract: ContractBuilder<TState>,
@@ -73,27 +81,27 @@ export class ServerEndpointBuilder<
       TState["query"],
       TState["request"],
       TState["responses"],
-      TServerContext,
-      TRequestContext
+      TServerEnvironment,
+      TRequestVariables
     >,
   ) {}
 
-  /** Declare added fields with .use<{ user: User }>(); next merges them in. */
-  use<TRequestContextNext extends object = {}>(
+  /** Declare added variables with .use<{ user: User }>(); next merges them in. */
+  use<TRequestVariablesNext extends object = {}>(
     middleware: MiddlewareHandler<
       TState["params"],
       TState["query"],
       TState["request"],
       TState["responses"],
-      TServerContext,
-      TRequestContext,
-      TRequestContextNext
+      TServerEnvironment,
+      TRequestVariables,
+      TRequestVariablesNext
     >,
   ) {
     return new ServerEndpointBuilder<
       TState,
-      TServerContext,
-      AddContext<TRequestContext, TRequestContextNext>
+      TServerEnvironment,
+      AddVariables<TRequestVariables, TRequestVariablesNext>
     >(this.contract, composeMiddleware(this.compose, middleware));
   }
 
@@ -103,20 +111,20 @@ export class ServerEndpointBuilder<
       TState["query"],
       TState["request"],
       TState["responses"],
-      TServerContext,
-      TRequestContext
+      TServerEnvironment,
+      TRequestVariables
     >,
   ) {
     return contractHandler(this.contract, this.compose(handler));
   }
 }
 
-export function serverEndpoint<TServerContext = {}>() {
+export function serverEndpoint<TServerEnvironment = {}>() {
   return {
     contract<TState extends ReadyContractState>(
       contract: ContractBuilder<TState>,
     ) {
-      return new ServerEndpointBuilder<TState, TServerContext, {}>(
+      return new ServerEndpointBuilder<TState, TServerEnvironment, {}>(
         contract,
         (handler) => handler,
       );
@@ -124,10 +132,10 @@ export function serverEndpoint<TServerContext = {}>() {
   };
 }
 
-/** Bind a composed handler; omitted context gets fresh response headers. */
+/** Bind a composed handler; typed calls default to fresh headers and variables. */
 export function contractHandler<
   TState extends ReadyContractState,
-  TServerContext,
+  TServerEnvironment,
 >(
   contract: ContractBuilder<TState>,
   handler: EndpointHandler<
@@ -135,7 +143,7 @@ export function contractHandler<
     TState["query"],
     TState["request"],
     TState["responses"],
-    TServerContext,
+    TServerEnvironment,
     {}
   >,
 ): ServerEndpoint<
@@ -143,7 +151,7 @@ export function contractHandler<
   TState["query"],
   TState["request"],
   TState["responses"],
-  TServerContext,
+  TServerEnvironment,
   TState["method"]
 > {
   const definition = compileContract(contract);
@@ -168,32 +176,37 @@ export function contractHandler<
   }
 
   async function handle(
-    validRequest: ValidRequest<
+    context: RequestContextInput<
       TState["params"],
       TState["query"],
-      TState["request"]
+      TState["request"],
+      TServerEnvironment
     >,
-    serverContext: Readonly<TServerContext>,
-    requestContext: RequestContext = { headers: new Headers() },
   ): Promise<ContractResponse<NoInfer<TState["responses"]>>> {
-    return handler(validRequest, serverContext, requestContext);
+    return handler({
+      req: { ...context.req, headers: context.req.headers ?? new Headers() },
+      res: context.res ?? { headers: new Headers() },
+      env: context.env,
+      var: {},
+    });
   }
 
   async function fetchWithContext(
     request: Request,
-    serverContext: Readonly<TServerContext>,
+    env: Readonly<TServerEnvironment>,
   ): Promise<Response> {
     const requestExtract = await extractJsonRequest(request, definition.path);
-    const decodedRequest = decodeRequest(requestExtract);
-    const requestContext: RequestContext = { headers: new Headers() };
-    const response = await handle(
-      decodedRequest,
-      serverContext,
-      requestContext,
-    );
+    // Expose the decoded values through the server's readonly input view.
+    const decodedRequest = decodeRequest(requestExtract) as ServerRequest<
+      TState["params"],
+      TState["query"],
+      TState["request"]
+    >;
+    const res = { headers: new Headers() };
+    const response = await handle({ req: decodedRequest, env, res });
     const encodedResponse = encodeResponse({
       ...response,
-      headers: requestContext.headers,
+      headers: res.headers,
     });
     return createJsonResponse(encodedResponse);
   }

@@ -1,5 +1,5 @@
 import { describe, expectTypeOf, it } from "vitest";
-import { createClient } from "../client.js";
+import { createClient, type ClientResponse } from "../client.js";
 // import type { exampleFetch } from "./clientHandler.js";
 import { exampleContract } from "./contract.js";
 import { exampleHandler } from "./serverHandler.js";
@@ -18,20 +18,21 @@ describe("example client types", () => {
       params: { pathParam: number };
       query: { queryParam: "a" | "b" };
       body: { requestParam: boolean };
-      headers: Readonly<Headers>;
     }>();
     expectTypeOf(fetchExample).returns.resolves.toEqualTypeOf<
-      | {
-          status: 200;
-          body: {
-            hi: string;
-            pathParam: number;
-            queryParam: string;
-            requestParam: boolean;
-          };
-        }
-      | { status: 400; body: { error: string } }
-      | { status: 403; body: { error: "auth_please" } }
+      ClientResponse<
+        | {
+            status: 200;
+            body: {
+              hi: string;
+              pathParam: number;
+              queryParam: string;
+              requestParam: boolean;
+            };
+          }
+        | { status: 400; body: { error: string } }
+        | { status: 403; body: { error: "auth_please" } }
+      >
     >();
   });
 
@@ -40,7 +41,6 @@ describe("example client types", () => {
       params: { pathParam: 42 },
       query: { queryParam: "a" as const },
       body: { requestParam: true },
-      headers: new Headers(),
     };
 
     expectTypeOf(fetchExample).toBeCallableWith({

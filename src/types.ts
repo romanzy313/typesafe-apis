@@ -104,19 +104,65 @@ export type RequestExtract = {
   params: Record<string, string>;
   query: Record<string, string>;
   body: unknown;
-  headers: Readonly<Headers>;
+  headers: Headers;
 };
 
 export type ValidRequest<TParams, TQuery, TRequestBody> = {
   params: TParams;
   query: TQuery;
   body: TRequestBody;
-  headers: Readonly<Headers>;
 };
 
-/** Mutable response headers shared by middleware and the handler. */
-export type RequestContext = {
-  headers: Headers;
+/** Read methods only, including the collection passed to forEach callbacks. */
+export type ReadonlyHeaders = Readonly<
+  Omit<Headers, "append" | "delete" | "set" | "forEach"> & {
+    forEach(
+      callback: (value: string, key: string, headers: ReadonlyHeaders) => void,
+      thisArg?: unknown,
+    ): void;
+  }
+>;
+
+/** Preserve unconstrained and primitive inputs while making object fields readonly. */
+export type ReadonlyValue<T> = T extends object ? Readonly<T> : T;
+
+export type ServerRequest<TParams, TQuery, TRequestBody> = Readonly<
+  ValidRequest<
+    ReadonlyValue<TParams>,
+    ReadonlyValue<TQuery>,
+    ReadonlyValue<TRequestBody>
+  >
+> & { readonly headers: ReadonlyHeaders };
+
+/** One request's input, outgoing headers, environment, and middleware variables. */
+export type RequestContext<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TServerEnvironment,
+  TRequestVariables extends object = {},
+> = {
+  readonly req: ServerRequest<TParams, TQuery, TRequestBody>;
+  readonly res: { headers: Headers };
+  readonly env: Readonly<TServerEnvironment>;
+  readonly var: Readonly<TRequestVariables>;
+};
+
+/** Typed calls may omit headers; variables always start empty. */
+export type RequestContextInput<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TServerEnvironment,
+> = {
+  readonly req: Omit<
+    ServerRequest<TParams, TQuery, TRequestBody>,
+    "headers"
+  > & {
+    readonly headers?: ReadonlyHeaders;
+  };
+  readonly res?: { headers: Headers };
+  readonly env: Readonly<TServerEnvironment>;
 };
 
 export type ResponseExtract = {

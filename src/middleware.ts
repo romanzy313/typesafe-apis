@@ -5,29 +5,30 @@ import type {
   RequestContext,
   ResponseCodecs,
   StatusCode,
-  ValidRequest,
   ValidResponse,
 } from "./types.js";
 
 declare const middlewareResponses: unique symbol;
 
-/** Declare the minimum request, server context, and middleware responses. */
+/** Declare the required request, environment, variables, and middleware responses. */
 export type MiddlewareHandler<
   TParams,
   TQuery,
   TRequestBody,
   TResponses extends ResponseCodecs,
-  TServerContext,
-  TRequestContext extends object,
-  TRequestContextNext extends object,
+  TServerEnvironment,
+  TRequestVariables extends object,
+  TRequestVariablesNext extends object,
 > = {
   <TNextResponse extends ValidResponse<StatusCode, unknown>>(
-    req: ValidRequest<TParams, TQuery, TRequestBody>,
-    serverContext: Readonly<TServerContext>,
-    requestContext: RequestContext & TRequestContext,
-    next: (
-      context: TRequestContextNext & Partial<RequestContext>,
-    ) => Promise<TNextResponse>,
+    context: RequestContext<
+      TParams,
+      TQuery,
+      TRequestBody,
+      TServerEnvironment,
+      TRequestVariables
+    >,
+    next: (variables: TRequestVariablesNext) => Promise<TNextResponse>,
   ): Promise<ContractResponse<NoInfer<TResponses>> | TNextResponse>;
   // Keep response requirements when generic continuation types are compared.
   readonly [middlewareResponses]?: ContractResponse<TResponses>;
@@ -38,9 +39,9 @@ export type MiddlewareHandler<
  * Omitted request parts are unknown; omitted responses allow only next().
  */
 export function createMiddleware<
-  TServerContext = {},
-  TRequestContext extends object = {},
-  TRequestContextNext extends object = {},
+  TServerEnvironment = {},
+  TRequestVariables extends object = {},
+  TRequestVariablesNext extends object = {},
 >() {
   return <TState extends ContractState>(
     _requirements: ContractBuilder<TState>,
@@ -50,9 +51,9 @@ export function createMiddleware<
         TState["hasQuery"] extends true ? TState["query"] : unknown,
         TState["hasRequest"] extends true ? TState["request"] : unknown,
         TState["responses"],
-        TServerContext,
-        TRequestContext,
-        TRequestContextNext
+        TServerEnvironment,
+        TRequestVariables,
+        TRequestVariablesNext
       >
     >,
   ): MiddlewareHandler<
@@ -60,9 +61,9 @@ export function createMiddleware<
     TState["hasQuery"] extends true ? TState["query"] : unknown,
     TState["hasRequest"] extends true ? TState["request"] : unknown,
     TState["responses"],
-    TServerContext,
-    TRequestContext,
-    TRequestContextNext
+    TServerEnvironment,
+    TRequestVariables,
+    TRequestVariablesNext
   > => handler;
 }
 
@@ -70,20 +71,21 @@ type OptionalKeys<T> = {
   [TKey in keyof T]-?: {} extends Pick<T, TKey> ? TKey : never;
 }[keyof T];
 
-type OptionalContext<TCurrent, TNext> = {
+type OptionalVariables<TCurrent, TNext> = {
   [TKey in keyof TCurrent]:
-    TCurrent[TKey] | Required<TNext>[TKey & keyof TNext];
+    | TCurrent[TKey]
+    | Required<TNext>[TKey & keyof TNext];
 };
 
 // Optional updates can be absent, so overlapping fields retain their old type.
-export type AddContext<
-  TContext extends object,
-  TContextNext extends object,
-> = Omit<TContext, keyof TContextNext> &
-  Omit<TContextNext, keyof TContext & OptionalKeys<TContextNext>> &
-  OptionalContext<
-    Pick<TContext, keyof TContext & OptionalKeys<TContextNext>>,
-    TContextNext
+export type AddVariables<
+  TVariables extends object,
+  TVariablesNext extends object,
+> = Omit<TVariables, keyof TVariablesNext> &
+  Omit<TVariablesNext, keyof TVariables & OptionalKeys<TVariablesNext>> &
+  OptionalVariables<
+    Pick<TVariables, keyof TVariables & OptionalKeys<TVariablesNext>>,
+    TVariablesNext
   >;
 
 export type MiddlewareChain<
@@ -91,79 +93,68 @@ export type MiddlewareChain<
   TQuery,
   TRequestBody,
   TResponses extends ResponseCodecs,
-  TServerContext,
-  TRequestContext extends object,
+  TServerEnvironment,
+  TRequestVariables extends object,
 > = (
   handler: EndpointHandler<
     TParams,
     TQuery,
     TRequestBody,
     TResponses,
-    TServerContext,
-    TRequestContext
+    TServerEnvironment,
+    TRequestVariables
   >,
 ) => EndpointHandler<
   TParams,
   TQuery,
   TRequestBody,
   TResponses,
-  TServerContext,
+  TServerEnvironment,
   {}
 >;
 
-/** Extend the current chain with middleware and merge its added context. */
+/** Extend variables for downstream middleware while sharing request, response, and env. */
 export function composeMiddleware<
   TParams,
   TQuery,
   TRequestBody,
   TResponses extends ResponseCodecs,
-  TServerContext,
-  TRequestContext extends object,
-  TRequestContextNext extends object,
+  TServerEnvironment,
+  TRequestVariables extends object,
+  TRequestVariablesNext extends object,
 >(
   compose: MiddlewareChain<
     TParams,
     TQuery,
     TRequestBody,
     TResponses,
-    TServerContext,
-    TRequestContext
+    TServerEnvironment,
+    TRequestVariables
   >,
   middleware: MiddlewareHandler<
     TParams,
     TQuery,
     TRequestBody,
     TResponses,
-    TServerContext,
-    TRequestContext,
-    TRequestContextNext
+    TServerEnvironment,
+    TRequestVariables,
+    TRequestVariablesNext
   >,
 ): MiddlewareChain<
   TParams,
   TQuery,
   TRequestBody,
   TResponses,
-  TServerContext,
-  AddContext<TRequestContext, TRequestContextNext>
+  TServerEnvironment,
+  AddVariables<TRequestVariables, TRequestVariablesNext>
 > {
   return (handler) =>
-    compose(async (req, serverContext, requestContext) => {
-      const response = await middleware(
-        req,
-        serverContext,
-        requestContext,
-        async (addedContext) => {
-          const nextContext = {
-            ...requestContext,
-            ...addedContext,
-          };
-          try {
-            return await handler(req, serverContext, nextContext);
-          } finally {
-            // Propagate a replaced collection to outer middleware and callers.
-            requestContext.headers = nextContext.headers;
-          }
-        },
+    compose(async (context) => {
+      const response = await middleware(context, async (addedVariables) =>
+        handler({
+          ...context,
+          var: { ...context.var, ...addedVariables },
+        }),
       );
       if (response === undefined) {
         throw new Error("Middleware returned undefined");

@@ -7,7 +7,11 @@ import {
   serverEndpoint,
   type ServerEndpoint,
 } from "./server.js";
-import type { RequestContext, StatusCode, ValidRequest } from "./types.js";
+import type {
+  RequestContextInput,
+  ServerRequest,
+  StatusCode,
+} from "./types.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
 
@@ -62,33 +66,30 @@ function inputsFrom(c: ReturnType<typeof createContract>) {
 describe("serverEndpoint", () => {
   it("handles typed requests with a supplied base context", async () => {
     const incoming = new Headers({ "x-client": "example" });
-    const requestContext: RequestContext = {
+    const responseState = {
       headers: new Headers({ "x-base": "seed" }),
     };
-    const endpoint = contractHandler(
-      createContract(),
-      async (req, _server: Readonly<{}>, context) => {
-        expectTypeOf(context).toEqualTypeOf<RequestContext>();
-        expect(context).toBe(requestContext);
-        expect(req.headers).toBe(incoming);
-        context.headers.set("x-client-seen", req.headers.get("x-client")!);
-        return { status: 200, body: date };
-      },
-    );
+    const endpoint = contractHandler(createContract(), async ({ req, res }) => {
+      expectTypeOf(res.headers).toEqualTypeOf<Headers>();
+      expect(res).toBe(responseState);
+      expect(req.headers).toBe(incoming);
+      res.headers.set("x-client-seen", req.headers.get("x-client")!);
+      return { status: 200, body: date };
+    });
 
-    const response = await endpoint.handle(
-      {
+    const response = await endpoint.handle({
+      req: {
         params: { id: 7 },
         query: { filter: "b" },
         body: { enabled: true },
         headers: incoming,
       },
-      {},
-      requestContext,
-    );
+      env: {},
+      res: responseState,
+    });
 
     expect(response).toEqual({ status: 200, body: date });
-    expect([...requestContext.headers]).toEqual([
+    expect([...responseState.headers]).toEqual([
       ["x-base", "seed"],
       ["x-client-seen", "example"],
     ]);
@@ -99,22 +100,21 @@ describe("serverEndpoint", () => {
     const c = createContract();
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
     const endpoint = serverEndpoint().contract(c).handler(handler);
-    const request: Parameters<typeof endpoint.handle>[0] = {
+    const request: Parameters<typeof endpoint.handle>[0]["req"] = {
       params: { id: 7 },
       query: { filter: "b" },
       body: { enabled: false },
       headers: new Headers(),
     };
 
-    const response = await endpoint.handle(request, {});
+    const response = await endpoint.handle({ req: request, env: {} });
 
-    expect(handler).toHaveBeenCalledExactlyOnceWith(
-      request,
-      {},
-      {
-        headers: new Headers(),
-      },
-    );
+    expect(handler).toHaveBeenCalledExactlyOnceWith({
+      req: request,
+      env: {},
+      res: { headers: new Headers() },
+      var: {},
+    });
     expect(response).toEqual({ status: 200, body: date });
     expect(response.body).toBe(date);
     expect(compileContract(c).params.decode).not.toHaveBeenCalled();
@@ -146,16 +146,17 @@ describe("serverEndpoint", () => {
     expect(compileContract(c).request.decode).toHaveBeenCalledExactlyOnceWith({
       enabled: true,
     });
-    expect(handler).toHaveBeenCalledExactlyOnceWith(
-      {
+    expect(handler).toHaveBeenCalledExactlyOnceWith({
+      req: {
         params: { id: 42 },
         query: { filter: "a" },
         body: { enabled: true },
         headers: new Headers({ "content-type": "application/json" }),
       },
-      {},
-      { headers: new Headers() },
-    );
+      env: {},
+      res: { headers: new Headers() },
+      var: {},
+    });
     expect(
       compileContract(c).responses[200].encode,
     ).toHaveBeenCalledExactlyOnceWith(date);
@@ -289,16 +290,17 @@ describe("serverEndpoint", () => {
     );
     expect(compileContract(c).query.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(request.decode).toHaveBeenCalledExactlyOnceWith(undefined);
-    expect(handler).toHaveBeenCalledExactlyOnceWith(
-      {
+    expect(handler).toHaveBeenCalledExactlyOnceWith({
+      req: {
         params: { id: 42 },
         query: { filter: "a" },
         body: undefined,
         headers: new Headers(),
       },
-      {},
-      { headers: new Headers() },
-    );
+      env: {},
+      res: { headers: new Headers() },
+      var: {},
+    });
   });
 
   it.each(["params", "query", "request"] as const)(
@@ -394,6 +396,80 @@ describe("serverEndpoint", () => {
 });
 
 describe("serverEndpoint types", () => {
+  it("keeps server input readonly and server output mutable", async () => {
+    const c = contract()
+      .method("POST")
+      .path("/items/:id", zodCodec(z.object({ id: z.string() })))
+      .query(zodCodec(z.object({ filter: z.string() })))
+      .request(zodCodec(z.object({ name: z.string() })))
+      .response(200, zodCodec(z.object({ name: z.string() })));
+    const endpoint = serverEndpoint<{ prefix: string }>()
+      .contract(c)
+      .use<{ user: string }>(async (context, next) => {
+        expectTypeOf(context.var).toEqualTypeOf<Readonly<{}>>();
+        if (false) {
+          // @ts-expect-error The request reference is readonly.
+          context.req = context.req;
+          // @ts-expect-error Request parts are readonly.
+          context.req.params = { id: "changed" };
+          // @ts-expect-error Decoded parameter fields are readonly.
+          context.req.params.id = "changed";
+          // @ts-expect-error Decoded query fields are readonly.
+          context.req.query.filter = "changed";
+          // @ts-expect-error Decoded body fields are readonly.
+          context.req.body.name = "changed";
+          // @ts-expect-error The incoming header collection cannot be replaced.
+          context.req.headers = new Headers();
+          // @ts-expect-error Incoming headers expose no set method.
+          context.req.headers.set("x-test", "changed");
+          // @ts-expect-error Incoming headers expose no append method.
+          context.req.headers.append("x-test", "changed");
+          // @ts-expect-error Incoming headers expose no delete method.
+          context.req.headers.delete("x-test");
+          context.req.headers.forEach((_value, _key, headers) => {
+            // @ts-expect-error Iteration cannot expose mutable headers either.
+            headers.set("x-test", "changed");
+          });
+          // @ts-expect-error Environment fields are readonly.
+          context.env.prefix = "changed";
+          // @ts-expect-error Variables are extended through next.
+          context.var = { user: "changed" };
+        }
+        context.res.headers.set("x-before", "set");
+        return next({ user: "Ada" });
+      })
+      .handler(async (context) => {
+        expect([...context.req.headers]).toEqual([]);
+        if (false) {
+          // @ts-expect-error Established variable fields are readonly.
+          context.var.user = "changed";
+        }
+        context.res.headers = new Headers({ "x-user": context.var.user });
+        context.res.headers.append("x-test", "set");
+        context.res.headers.delete("x-test");
+        return {
+          status: 200,
+          body: { name: context.env.prefix + context.req.body.name },
+        };
+      });
+    const res = { headers: new Headers() };
+    const response = await endpoint.handle({
+      req: {
+        params: { id: "one" },
+        query: { filter: "active" },
+        body: { name: "item" },
+      },
+      env: { prefix: "new " },
+      res,
+    });
+    expect(response).toEqual({ status: 200, body: { name: "new item" } });
+    expect(res.headers.get("x-user")).toBe("Ada");
+    response.status = 200;
+    response.body.name = "updated";
+    response.body = { name: "replaced" };
+    expect(response.body.name).toBe("replaced");
+  });
+
   it("accepts Hono status codes and excludes codes outside its declaration", () => {
     expectTypeOf<
       100 | 103 | 207 | 226 | 308 | 418 | 425 | 451 | 507 | 511
@@ -409,7 +485,7 @@ describe("serverEndpoint types", () => {
       .response(201, compileContract(original).responses[200])
       .response(503, compileContract(original).responses[400]);
     const builder = serverEndpoint().contract(c);
-    const endpoint = builder.handler(async (req) => {
+    const endpoint = builder.handler(async ({ req }) => {
       if (req.body.enabled) {
         return { status: 201, body: date };
       }
@@ -442,9 +518,9 @@ describe("serverEndpoint types", () => {
   it("infers decoded request values and status-specific response bodies", () => {
     const c = createContract();
     const builder = serverEndpoint().contract(c);
-    const endpoint = builder.handler(async (req) => {
+    const endpoint = builder.handler(async ({ req }) => {
       expectTypeOf(req).toEqualTypeOf<
-        ValidRequest<
+        ServerRequest<
           { id: number },
           { filter: "a" | "b" },
           { enabled: boolean }
@@ -480,46 +556,48 @@ describe("serverEndpoint types", () => {
     >();
     expectTypeOf(endpoint.handle).parameters.toEqualTypeOf<
       [
-        ValidRequest<
+        RequestContextInput<
           { id: number },
           { filter: "a" | "b" },
-          { enabled: boolean }
+          { enabled: boolean },
+          {}
         >,
-        Readonly<{}>,
-        (RequestContext | undefined)?,
       ]
     >();
     expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
-    const validRequest: Parameters<typeof endpoint.handle>[0] = {
+    const validRequest: Parameters<typeof endpoint.handle>[0]["req"] = {
       params: { id: 42 },
       query: { filter: "a" },
       body: { enabled: true },
       headers: new Headers(),
     };
-    expectTypeOf(endpoint.handle).toBeCallableWith(validRequest, {});
-    expectTypeOf(endpoint.handle).toBeCallableWith(
+    expectTypeOf(endpoint.handle).toBeCallableWith({
+      req: validRequest,
+      env: {},
+    });
+    expectTypeOf(endpoint.handle).toBeCallableWith({
       // @ts-expect-error handle requires decoded numeric parameters.
-      { ...validRequest, params: { id: "42" } },
-      {},
-    );
-    expectTypeOf(endpoint.handle).toBeCallableWith(
+      req: { ...validRequest, params: { id: "42" } },
+      env: {},
+    });
+    expectTypeOf(endpoint.handle).toBeCallableWith({
       // @ts-expect-error handle only accepts the declared query values.
-      { ...validRequest, query: { filter: "c" } },
-      {},
-    );
-    expectTypeOf(endpoint.handle).toBeCallableWith(
+      req: { ...validRequest, query: { filter: "c" } },
+      env: {},
+    });
+    expectTypeOf(endpoint.handle).toBeCallableWith({
       // @ts-expect-error handle requires the declared request body.
-      { ...validRequest, body: {} },
-      {},
-    );
+      req: { ...validRequest, body: {} },
+      env: {},
+    });
     expectTypeOf(endpoint.fetchWithContext).toEqualTypeOf<
-      (request: Request, serverContext: Readonly<{}>) => Promise<Response>
+      (request: Request, env: Readonly<{}>) => Promise<Response>
     >();
     const request = createRequest();
     // @ts-expect-error Native Requests must go through fetchWithContext.
-    expectTypeOf(endpoint.handle).toBeCallableWith(request, {});
+    expectTypeOf(endpoint.handle).toBeCallableWith({ req: request, env: {} });
     const url = new URL(request.url);
     expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(request, {});
     // @ts-expect-error The endpoint requires a Request, not a URL string.
@@ -539,15 +617,15 @@ describe("serverEndpoint types", () => {
     const endpoint = serverEndpoint()
       .contract(createContract())
       .handler(async () => ({ status: 200, body: date }));
-    const response = await endpoint.handle(
-      {
+    const response = await endpoint.handle({
+      req: {
         params: { id: 42 },
         query: { filter: "a" },
         body: { enabled: true },
         headers: new Headers(),
       },
-      {},
-    );
+      env: {},
+    });
 
     if (response.status === 200) {
       expectTypeOf(response.body).toEqualTypeOf<Date>();
@@ -576,7 +654,7 @@ describe("serverEndpoint types", () => {
     builder.handler(async () => ({ status: 400, body: {} }));
 
     // @ts-expect-error The decoded path parameter is a number.
-    builder.handler(async (_req: { params: { id: string } }) => ({
+    builder.handler(async (_context: { req: { params: { id: string } } }) => ({
       status: 200,
       body: date,
     }));
