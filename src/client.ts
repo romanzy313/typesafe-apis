@@ -1,6 +1,11 @@
+import {
+  compileContract,
+  type ContractBuilder,
+  type InferRequest,
+  type ReadyContractState,
+} from "./contract.js";
 import type {
   Codec,
-  Contract,
   ContractResponse,
   MinFetch,
   RequestExtract,
@@ -25,9 +30,14 @@ export type TypesafeFetch<
 ) => Promise<ContractResponse<TResponses>>;
 
 export type Client = {
-  contract<TParams, TQuery, TRequestBody, TResponses extends ResponseCodecs>(
-    c: Contract<Codec<TParams>, Codec<TQuery>, Codec<TRequestBody>, TResponses>,
-  ): TypesafeFetch<TParams, TQuery, TRequestBody, TResponses>;
+  contract<TState extends ReadyContractState>(
+    c: ContractBuilder<TState>,
+  ): TypesafeFetch<
+    TState["params"],
+    TState["query"],
+    TState["request"],
+    TState["responses"]
+  >;
 };
 
 export function createClient(opts: ClientOptions = {}): Client {
@@ -35,21 +45,18 @@ export function createClient(opts: ClientOptions = {}): Client {
   const fetch = opts.fetch ?? globalThis.fetch;
 
   return {
-    contract<TParams, TQuery, TRequestBody, TResponses extends ResponseCodecs>(
-      c: Contract<
-        Codec<TParams>,
-        Codec<TQuery>,
-        Codec<TRequestBody>,
-        TResponses
-      >,
-    ): TypesafeFetch<TParams, TQuery, TRequestBody, TResponses> {
-      const { definition } = c;
-      if (!definition.route.method) {
-        throw new Error("Contract must define a method with .method()");
-      }
+    contract<TState extends ReadyContractState>(
+      c: ContractBuilder<TState>,
+    ): TypesafeFetch<
+      TState["params"],
+      TState["query"],
+      TState["request"],
+      TState["responses"]
+    > {
+      const definition = compileContract(c);
 
       function encodeRequest(
-        req: TypedRequest<TParams, TQuery, TRequestBody>,
+        req: InferRequest<ContractBuilder<TState>>,
       ): RequestExtract {
         const params = definition.params.encode(req.params);
         assertParams(params);
@@ -65,7 +72,7 @@ export function createClient(opts: ClientOptions = {}): Client {
       }
       function decodeResponse(
         response: Awaited<ReturnType<typeof extractJsonResponse>>,
-      ): ContractResponse<TResponses> {
+      ): ContractResponse<TState["responses"]> {
         const codecs: Partial<Record<number, Codec>> = definition.responses;
         const codec = codecs[response.status];
         if (!codec) {
@@ -76,19 +83,19 @@ export function createClient(opts: ClientOptions = {}): Client {
         return {
           status: response.status,
           body: codec.decode(response.body),
-        } as ContractResponse<TResponses>;
+        } as ContractResponse<TState["responses"]>;
       }
 
       return async (
-        typedRequest: TypedRequest<TParams, TQuery, TRequestBody>,
-      ): Promise<ContractResponse<TResponses>> => {
+        typedRequest: InferRequest<ContractBuilder<TState>>,
+      ): Promise<ContractResponse<TState["responses"]>> => {
         const encodedRequest = encodeRequest(typedRequest);
 
         const request = createJsonRequest(
           encodedRequest,
           baseUrl,
-          definition.route.method,
-          definition.route.path,
+          definition.method,
+          definition.path,
         );
 
         const response = await fetch(request);

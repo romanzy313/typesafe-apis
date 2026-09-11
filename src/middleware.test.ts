@@ -2,7 +2,7 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
-import { contract } from "./contract.js";
+import { compileContract, contract, type InferResponses } from "./contract.js";
 import { createMiddleware, type MiddlewareHandler } from "./middleware.js";
 import { contractHandler, serverEndpoint } from "./server.js";
 import type { RequestContext, TypedRequest } from "./types.js";
@@ -11,9 +11,11 @@ const stringToNumber = z.codec(z.string(), z.number(), {
   decode: Number,
   encode: String,
 });
-const authContract = contract()
-  .query(zodCodec(z.object({ fail: z.stringbool() })))
-  .response(403, zodCodec(z.object({ error: z.literal("auth_please") })));
+
+const authQuery = zodCodec(z.object({ fail: z.stringbool() }));
+const authResponse = zodCodec(z.object({ error: z.literal("auth_please") }));
+const authContract = contract().query(authQuery).response(403, authResponse);
+
 const testContract = authContract
   .method("POST")
   .path("/test/:id", zodCodec(z.object({ id: stringToNumber })))
@@ -33,19 +35,13 @@ const authenticate = createMiddleware<
   { userName: string },
   TraceContext,
   AuthContext
->()(
-  {
-    query: authContract.definition.query,
-    responses: authContract.definition.responses,
-  },
-  async (req, server, context, next) => {
-    expectTypeOf(context.traceId).toEqualTypeOf<string>();
-    if (req.query.fail) {
-      return { status: 403, body: { error: "auth_please" } };
-    }
-    return next({ user: { name: server.userName } });
-  },
-);
+>()(authContract, async (req, server, context, next) => {
+  expectTypeOf(context.traceId).toEqualTypeOf<string>();
+  if (req.query.fail) {
+    return { status: 403, body: { error: "auth_please" } };
+  }
+  return next({ user: { name: server.userName } });
+});
 
 function createRequest(id = 7, fail = false) {
   return new Request(`https://example.com/test/${id}?fail=${fail}`, {
@@ -64,20 +60,50 @@ function tracedEndpoint() {
 }
 
 describe("createMiddleware", () => {
+  it("keeps an explicit absent-body requirement distinct from an omitted one", async () => {
+    const requirements = contract().request(zodCodec(z.undefined()));
+    const middleware = createMiddleware()(
+      requirements,
+      async (req, _server, _context, next) => {
+        expectTypeOf(req.body).toBeUndefined();
+        expectTypeOf(req.params).toBeUnknown();
+        expectTypeOf(req.query).toBeUnknown();
+        return next({});
+      },
+    );
+    const endpoint = serverEndpoint()
+      .contract(contract().method("GET").response(200, zodCodec(z.string())))
+      .use(middleware)
+      .handler(async () => ({ status: 200, body: "ok" }));
+    await expect(
+      endpoint.handle(
+        {
+          params: {},
+          query: {},
+          body: undefined,
+          headers: new Headers(),
+        },
+        {},
+      ),
+    ).resolves.toEqual({ status: 200, body: "ok" });
+    // @ts-expect-error This middleware requires an absent body.
+    serverEndpoint().contract(testContract).use(middleware);
+  });
+
   it("infers decoded requirements and preserves explicit context types", () => {
     const middleware = createMiddleware<
       ServerContext,
       TraceContext,
       AuthContext
-    >()(testContract.definition, async (req, server, context, next) => {
+    >()(testContract, async (req, server, context, next) => {
       expectTypeOf(req).toEqualTypeOf<
         TypedRequest<{ id: number }, { fail: boolean }, { name: string }>
       >();
       expectTypeOf(server).toEqualTypeOf<Readonly<ServerContext>>();
       expectTypeOf(context).toEqualTypeOf<RequestContext & TraceContext>();
-      expectTypeOf(next).parameter(0).toEqualTypeOf<
-        AuthContext & Partial<RequestContext>
-      >();
+      expectTypeOf(next)
+        .parameter(0)
+        .toEqualTypeOf<AuthContext & Partial<RequestContext>>();
       return next({ user: { name: server.userName } });
     });
 
@@ -86,7 +112,7 @@ describe("createMiddleware", () => {
         { id: number },
         { fail: boolean },
         { name: string },
-        typeof testContract.definition.responses,
+        InferResponses<typeof testContract>,
         ServerContext,
         TraceContext,
         AuthContext
@@ -97,7 +123,7 @@ describe("createMiddleware", () => {
 
   it("allows middleware without request or response requirements", async () => {
     const middleware = createMiddleware()(
-      {},
+      contract(),
       async (req, server, context, next) => {
         expectTypeOf(req).toEqualTypeOf<
           TypedRequest<unknown, unknown, unknown>
@@ -130,24 +156,24 @@ describe("createMiddleware", () => {
     const withBody = async (_req: { body: { name: number } }) => nextOnly();
 
     createMiddleware()(
-      { params: testContract.definition.params },
+      contract().path("/:id", zodCodec(z.object({ id: stringToNumber }))),
       // @ts-expect-error The codec decodes id to a number.
       withParams,
     );
     createMiddleware()(
-      { query: authContract.definition.query },
+      authContract,
       // @ts-expect-error The codec can decode fail to either boolean value.
       withQuery,
     );
     createMiddleware()(
-      { request: testContract.definition.request },
+      contract().request(zodCodec(z.object({ name: z.string() }))),
       // @ts-expect-error The codec decodes name to a string.
       withBody,
     );
   });
 
   it("rejects responses not declared by its requirements", () => {
-    const requirements = { responses: authContract.definition.responses };
+    const requirements = contract().response(403, authResponse);
 
     createMiddleware()(
       requirements,
@@ -160,13 +186,13 @@ describe("createMiddleware", () => {
       async () => ({ status: 403 as const, body: { error: "other" as const } }),
     );
     createMiddleware()(
-      {},
+      contract(),
       // @ts-expect-error Without response requirements middleware must use next.
       async () => ({ status: 403 as const, body: { error: "auth_please" } }),
     );
     createMiddleware()(
       // @ts-expect-error Status 104 is absent from Hono's StatusCode.
-      { responses: { ...requirements.responses, 104: zodCodec(z.string()) } },
+      requirements.response(104, zodCodec(z.string())),
       async (_req, _server, _context, next) => next({}),
     );
   });
@@ -347,7 +373,7 @@ describe("middleware composition", () => {
         headers: new Headers(),
       }),
     ).resolves.toEqual({ status: 200, body: { hello: "Hello Ada, world" } });
-    expect(bound.definition).toBe(testContract.definition);
+    expect(bound.definition).toEqual(compileContract(testContract));
     expect(order).toEqual([
       "trace before",
       "inner before",
@@ -664,9 +690,9 @@ describe("middleware types", () => {
     expectTypeOf(bound.fetchWithContext).toEqualTypeOf<
       (request: Request, server: Readonly<ServerContext>) => Promise<Response>
     >();
-    expectTypeOf(bound.handle).parameter(1).toEqualTypeOf<
-      Readonly<ServerContext>
-    >();
+    expectTypeOf(bound.handle)
+      .parameter(1)
+      .toEqualTypeOf<Readonly<ServerContext>>();
     const typedRequest = {
       params: { id: 7 },
       query: { fail: false },
@@ -739,7 +765,7 @@ describe("middleware types", () => {
       .method("GET")
       .path("/wrong", zodCodec(z.object({})))
       .query(zodCodec(z.object({ fail: z.string() })))
-      .response(403, authContract.definition.responses[403]);
+      .response(403, authResponse);
     const wrongQuery = serverEndpoint<ServerContext>()
       .contract(wrongQueryContract)
       .use<TraceContext>(async (_req, _server, _context, next) =>
@@ -751,7 +777,7 @@ describe("middleware types", () => {
     const missingResponseContract = contract()
       .method("GET")
       .path("/missing", zodCodec(z.object({})))
-      .query(authContract.definition.query)
+      .query(authQuery)
       .response(200, zodCodec(z.string()));
     const missingResponse = serverEndpoint<ServerContext>()
       .contract(missingResponseContract)

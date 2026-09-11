@@ -2,7 +2,13 @@ import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
-import { contract } from "./contract.js";
+import {
+  compileContract,
+  contract,
+  type InferDefinition,
+  type InferRequest,
+  type InferResponses,
+} from "./contract.js";
 import { createMiddleware } from "./middleware.js";
 import { serverEndpoint } from "./server.js";
 
@@ -14,6 +20,202 @@ const params = zodCodec(z.object({ id: stringToNumber }));
 const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
   decode: (value) => new Date(value),
   encode: (value) => value.toISOString(),
+});
+
+describe("contract compilation", () => {
+  it("defers nested composition and preserves response declaration order", () => {
+    const page = zodCodec(z.object({ page: stringToNumber }));
+    const filter = zodCodec(z.object({ filter: z.string() }));
+    const firstResponse = zodCodec(z.object({ value: z.string() }));
+    const secondResponse = zodCodec(
+      z.object({ value: z.string(), extra: z.string() }),
+    );
+    const intersection = vi.spyOn(page, "intersection");
+    const union = vi.spyOn(firstResponse, "union");
+    const base = contract()
+      .path("/base/")
+      .query(page)
+      .response(200, firstResponse);
+    const nested = contract().merge(
+      contract().path("/items/").query(filter).response(200, secondResponse),
+    );
+    const ready = base.merge(nested).method("GET").path("/:id", params);
+
+    expect(base).not.toHaveProperty("definition");
+    expect(ready).not.toHaveProperty("definition");
+    // @ts-expect-error Builders have no executable definition, even when ready.
+    expectTypeOf(ready.definition);
+    expect(intersection).not.toHaveBeenCalled();
+    expect(union).not.toHaveBeenCalled();
+
+    const definition = compileContract(ready);
+    expect(Object.keys(definition)).toEqual([
+      "method",
+      "path",
+      "params",
+      "query",
+      "request",
+      "responses",
+    ]);
+    expect(definition.path).toBe("/base/items/:id");
+    expectTypeOf(definition.method).toEqualTypeOf<"GET">();
+    expectTypeOf(definition).toEqualTypeOf<InferDefinition<typeof ready>>();
+    expectTypeOf<InferRequest<typeof ready>>().toEqualTypeOf<{
+      params: { id: number };
+      query: { page: number } & { filter: string };
+      body: undefined;
+      headers: Readonly<Headers>;
+    }>();
+    expect(intersection).toHaveBeenCalledExactlyOnceWith(filter);
+    expect(union).toHaveBeenCalledExactlyOnceWith(secondResponse);
+    expect(definition.query.decode({ page: "2", filter: "active" })).toEqual({
+      page: 2,
+      filter: "active",
+    });
+    const overlapping = { value: "ok", extra: "kept by the second codec" };
+    expect(definition.responses[200].decode(overlapping)).toEqual({
+      value: "ok",
+    });
+    expect(definition.responses[200].encode(overlapping)).toEqual({
+      value: "ok",
+    });
+    expect(compileContract(ready)).not.toBe(definition);
+    expect(intersection).toHaveBeenCalledTimes(2);
+    expect(union).toHaveBeenCalledTimes(2);
+
+    const sibling = base.method("GET").path("/other");
+    expect(compileContract(sibling).path).toBe("/base/other");
+    expect(definition.path).toBe("/base/items/:id");
+  });
+
+  it("compiles once per binding and uses prepared codecs in both transports", async () => {
+    const body = zodCodec(z.object({ name: z.string() }));
+    const response = zodCodec(z.object({ name: z.string() }));
+    const preparedBody = zodCodec(z.object({ name: z.string() }));
+    const preparedResponse = zodCodec(z.object({ name: z.string() }));
+    const compileBody = vi.spyOn(body, "compile").mockReturnValue(preparedBody);
+    const compileResponse = vi
+      .spyOn(response, "compile")
+      .mockReturnValue(preparedResponse);
+    const encodeBody = vi.spyOn(preparedBody, "encode");
+    const decodeBody = vi.spyOn(preparedBody, "decode");
+    const encodeResponse = vi.spyOn(preparedResponse, "encode");
+    const decodeResponse = vi.spyOn(preparedResponse, "decode");
+    const requirements = contract().request(body).response(200, response);
+    const middleware = createMiddleware()(
+      requirements,
+      async (req, _server, _context, next) => {
+        expectTypeOf(req.params).toBeUnknown();
+        expectTypeOf(req.query).toBeUnknown();
+        expectTypeOf(req.body).toEqualTypeOf<{ name: string }>();
+        return next({});
+      },
+    );
+    const ready = requirements.method("POST").path("/items");
+    const pending = serverEndpoint().contract(ready).use(middleware);
+    expect(compileBody).not.toHaveBeenCalled();
+    expect(compileResponse).not.toHaveBeenCalled();
+
+    const endpoint = pending.handler(async (req) => ({
+      status: 200,
+      body: req.body,
+    }));
+    expect(endpoint.definition.request).toBe(preparedBody);
+    expect(endpoint.definition.responses[200]).toBe(preparedResponse);
+    expect(compileBody).toHaveBeenCalledTimes(1);
+    expect(compileResponse).toHaveBeenCalledTimes(1);
+    const call = createClient({
+      baseUrl: "https://example.com",
+      fetch: (request) => endpoint.fetchWithContext(request, {}),
+    }).contract(ready);
+    expect(compileBody).toHaveBeenCalledTimes(2);
+    expect(compileResponse).toHaveBeenCalledTimes(2);
+    const request = {
+      params: {},
+      query: {},
+      body: { name: "item" },
+      headers: new Headers(),
+    };
+    for (let index = 0; index < 2; index++) {
+      await expect(call(request)).resolves.toEqual({
+        status: 200,
+        body: request.body,
+      });
+    }
+    expect(encodeBody).toHaveBeenCalledTimes(2);
+    expect(decodeBody).toHaveBeenCalledTimes(2);
+    expect(encodeResponse).toHaveBeenCalledTimes(2);
+    expect(decodeResponse).toHaveBeenCalledTimes(2);
+    await expect(endpoint.handle(request, {})).resolves.toEqual({
+      status: 200,
+      body: request.body,
+    });
+    expect(decodeBody).toHaveBeenCalledTimes(2);
+    expect(compileBody).toHaveBeenCalledTimes(2);
+    expect(compileResponse).toHaveBeenCalledTimes(2);
+  });
+
+  it("compiles when a client binds first and propagates compilation failures", () => {
+    const response = zodCodec(z.string());
+    const error = new Error("Cannot prepare codec");
+    const compile = vi.spyOn(response, "compile").mockImplementationOnce(() => {
+      throw error;
+    });
+    const ready = contract().method("GET").response(200, response);
+    const client = createClient();
+    expect(() => client.contract(ready)).toThrow(error);
+    expect(() => client.contract(ready)).not.toThrow();
+    serverEndpoint()
+      .contract(ready)
+      .handler(async () => ({ status: 200, body: "ok" }));
+    expect(compile).toHaveBeenCalledTimes(3);
+  });
+
+  it("validates methods and paths at compilation without invoking codecs", () => {
+    const codec = zodCodec(z.object({}));
+    const compile = vi.spyOn(codec, "compile");
+    const base = contract().query(codec);
+    const duplicate = base.method("GET").path("/:id/:id");
+    expect(() => compileContract(duplicate)).toThrow(
+      "Duplicate path parameter id",
+    );
+    expect(() => {
+      // @ts-expect-error A compiler input must have a method.
+      compileContract(base);
+    }).toThrow("Contract must define a method with .method()");
+    // @ts-expect-error Conflicting literal methods are rejected statically too.
+    const conflict = base.method("GET").merge(contract().method("POST"));
+    expect(() => compileContract(conflict)).toThrow(
+      "Cannot compose different methods: GET and POST",
+    );
+    expect(compile).not.toHaveBeenCalled();
+  });
+
+  it("preserves alternatives inside intersected request codecs", () => {
+    const alternatives = zodCodec(
+      z.object({ kind: z.literal("a"), value: z.number() }),
+    ).union(zodCodec(z.object({ kind: z.literal("b"), value: z.string() })));
+    const ready = contract()
+      .request(alternatives)
+      .merge(contract().request(zodCodec(z.object({ version: z.number() }))))
+      .method("POST");
+    const definition = compileContract(ready);
+    expectTypeOf(definition.request.decode).returns.toEqualTypeOf<
+      ({ kind: "a"; value: number } | { kind: "b"; value: string }) & {
+        version: number;
+      }
+    >();
+    for (const body of [
+      { kind: "a", value: 1, version: 2 },
+      { kind: "b", value: "one", version: 2 },
+    ] as const) {
+      expect(definition.request.decode(body)).toEqual(body);
+      expect(definition.request.encode(body)).toEqual(body);
+    }
+    expect(() => definition.request.decode({ kind: "a", value: 1 })).toThrow(
+      z.ZodError,
+    );
+  });
 });
 
 describe("contract composition", () => {
@@ -38,61 +240,79 @@ describe("contract composition", () => {
       .request(zodCodec(z.object({ enabled: z.boolean() })))
       .response(201, zodCodec(z.object({ created: z.boolean() })));
 
-    expect(base.definition.route.method).toBeUndefined();
-    expect(first.definition.route).toEqual({
+    expect(base).not.toHaveProperty("definition");
+    expect(compileContract(first)).toMatchObject({
       method: "GET",
       path: "/items/:id",
     });
-    expect(second.definition.route).toEqual({
+    expect(compileContract(second)).toMatchObject({
       method: "POST",
       path: "/other/:id",
     });
-    expect(Object.keys(base.definition.responses)).toEqual(["401", "403"]);
-    expect(Object.keys(first.definition.responses)).toEqual([
+    expect(Object.keys(compileContract(base.method("GET")).responses)).toEqual([
+      "401",
+      "403",
+    ]);
+    expect(Object.keys(compileContract(first).responses)).toEqual([
       "200",
       "401",
       "403",
     ]);
-    expect(Object.keys(second.definition.responses)).toEqual([
+    expect(Object.keys(compileContract(second).responses)).toEqual([
       "201",
       "401",
       "403",
     ]);
-    expect(base.definition.query.decode({ page: "2" })).toEqual({ page: 2 });
     expect(
-      first.definition.query.decode({ page: "2", filter: "active" }),
+      compileContract(base.method("GET")).query.decode({ page: "2" }),
+    ).toEqual({ page: 2 });
+    expect(
+      compileContract(first).query.decode({ page: "2", filter: "active" }),
     ).toEqual({
       page: 2,
       filter: "active",
     });
-    expect(second.definition.query.decode({ page: "2", sort: "asc" })).toEqual({
+    expect(
+      compileContract(second).query.decode({ page: "2", sort: "asc" }),
+    ).toEqual({
       page: 2,
       sort: "asc",
     });
-    expect(() => first.definition.query.decode({ filter: "active" })).toThrow(
-      z.ZodError,
-    );
-    expect(() => first.definition.query.decode({ page: "2" })).toThrow(
+    expect(() =>
+      compileContract(first).query.decode({ filter: "active" }),
+    ).toThrow(z.ZodError);
+    expect(() => compileContract(first).query.decode({ page: "2" })).toThrow(
       z.ZodError,
     );
     expect(() =>
-      second.definition.query.decode({ page: "2", filter: "active" }),
+      compileContract(second).query.decode({ page: "2", filter: "active" }),
     ).toThrow(z.ZodError);
     expect(
-      first.definition.responses[403].decode({ error: "disabled", id: 7 }),
+      compileContract(first).responses[403].decode({
+        error: "disabled",
+        id: 7,
+      }),
     ).toEqual({
       error: "disabled",
       id: 7,
     });
     expect(() =>
-      base.definition.responses[403].decode({ error: "disabled", id: 7 }),
+      compileContract(base.method("GET")).responses[403].decode({
+        error: "disabled",
+        id: 7,
+      }),
     ).toThrow(z.ZodError);
     expect(() =>
-      second.definition.responses[403].decode({ error: "disabled", id: 7 }),
+      compileContract(second).responses[403].decode({
+        error: "disabled",
+        id: 7,
+      }),
     ).toThrow(z.ZodError);
-    expect(base.definition.request.decode(undefined)).toBeUndefined();
-    expect(first.definition.request.decode(undefined)).toBeUndefined();
-    expect(second.definition.request.decode({ enabled: true })).toEqual({
+    expect(
+      compileContract(base.method("GET")).request.decode(undefined),
+    ).toBeUndefined();
+    expect(compileContract(first).request.decode(undefined)).toBeUndefined();
+    expect(compileContract(second).request.decode({ enabled: true })).toEqual({
       enabled: true,
     });
   });
@@ -121,24 +341,34 @@ describe("contract composition", () => {
 
     expect(final).not.toBe(base);
     expect(final).not.toBe(other);
-    expect(base.definition.route.method).toBeUndefined();
-    expect(other.definition.route.method).toBeUndefined();
-    expect(Object.keys(base.definition.responses)).toEqual(["403"]);
+    expect(base).not.toHaveProperty("definition");
+    expect(other).not.toHaveProperty("definition");
+    expect(Object.keys(compileContract(base.method("GET")).responses)).toEqual([
+      "403",
+    ]);
     expect(() =>
-      base.definition.responses[403].decode({
+      compileContract(base.method("GET")).responses[403].decode({
         error: "disabled",
         data: { id: 7 },
       }),
     ).toThrow(z.ZodError);
     expect(() =>
-      other.definition.responses[403].decode({ error: "forbidden" }),
+      compileContract(other.method("GET")).responses[403].decode({
+        error: "forbidden",
+      }),
     ).toThrow(z.ZodError);
-    expect(final.definition.query.encode({ page: 2, action: "read" })).toEqual({
+    expect(
+      compileContract(final).query.encode({ page: 2, action: "read" }),
+    ).toEqual({
       page: "2",
       action: "read",
     });
-    expect(base.definition.query.decode({ page: "2" })).toEqual({ page: 2 });
-    expect(other.definition.query.decode({ action: "read" })).toEqual({
+    expect(
+      compileContract(base.method("GET")).query.decode({ page: "2" }),
+    ).toEqual({ page: 2 });
+    expect(
+      compileContract(other.method("GET")).query.decode({ action: "read" }),
+    ).toEqual({
       action: "read",
     });
 
@@ -217,17 +447,17 @@ describe("contract composition", () => {
       headers: new Headers(),
     });
     // @ts-expect-error The disabled variant requires data.
-    serverEndpoint().contract(final).handler(async () => ({
+    builder.handler(async () => ({
       status: 403,
       body: { error: "disabled" },
     }));
     // @ts-expect-error A discriminator cannot be added by the handler.
-    serverEndpoint().contract(final).handler(async () => ({
+    builder.handler(async () => ({
       status: 403,
       body: { error: "other" },
     }));
     // @ts-expect-error This status was not declared by the contract.
-    serverEndpoint().contract(final).handler(async () => ({
+    builder.handler(async () => ({
       status: 401,
       body: { error: "unauthorized" },
     }));
@@ -261,16 +491,20 @@ describe("contract composition", () => {
       client.contract(base);
     }).toThrow("Contract must define a method with .method()");
     expect(() => {
-      // @ts-expect-error A new contract has no method.
-      serverEndpoint().contract(contract()).handler(async () => {
-        throw new Error("Must not run");
-      });
+      serverEndpoint()
+        // @ts-expect-error A new contract has no method.
+        .contract(contract())
+        .handler(async () => {
+          throw new Error("Must not run");
+        });
     }).toThrow("Contract must define a method with .method()");
     expect(() => {
       // @ts-expect-error A new contract has no method.
       client.contract(contract());
     }).toThrow("Contract must define a method with .method()");
-    expect(() => serverEndpoint().contract(ready).handler(handler)).not.toThrow();
+    expect(() =>
+      serverEndpoint().contract(ready).handler(handler),
+    ).not.toThrow();
     expect(() => client.contract(ready)).not.toThrow();
     expect(handler).not.toHaveBeenCalled();
     expect(fetch).not.toHaveBeenCalled();
@@ -334,7 +568,7 @@ describe("contract composition", () => {
       .response(200, zodCodec(z.object({ ok: z.boolean() })))
       .merge(contract())
       .query(zodCodec(z.object({ filter: z.string() })));
-    const query = c.definition.query;
+    const query = compileContract(c).query;
 
     expectTypeOf(query.decode).returns.toEqualTypeOf<
       { page: string } & { page: number } & { filter: string }
@@ -372,25 +606,31 @@ describe("contract composition", () => {
 
   it("preserves an impossible query after conflicting discriminators", () => {
     const c = contract()
+      .method("GET")
       .query(zodCodec(z.object({ mode: z.literal("a") })))
       .query(zodCodec(z.object({ mode: z.literal("b") })))
       .query(zodCodec(z.object({ filter: z.string() })));
 
-    expectTypeOf(c.definition.query.decode).returns.toBeNever();
-    expectTypeOf(c.definition.query.encode).parameter(0).toBeNever();
+    expectTypeOf(compileContract(c).query.decode).returns.toBeNever();
+    expectTypeOf(compileContract(c).query.encode).parameter(0).toBeNever();
     expect(() =>
-      c.definition.query.decode({ mode: "a", filter: "active" }),
+      compileContract(c).query.decode({ mode: "a", filter: "active" }),
     ).toThrow(z.ZodError);
   });
 
   it("preserves constraints on shared query fields", () => {
     const c = contract()
+      .method("GET")
       .query(zodCodec(z.object({ name: z.string().min(2) })))
       .query(zodCodec(z.object({ name: z.string().max(4) })));
 
-    expect(c.definition.query.decode({ name: "abc" })).toEqual({ name: "abc" });
-    expect(() => c.definition.query.decode({ name: "a" })).toThrow(z.ZodError);
-    expect(() => c.definition.query.encode({ name: "abcde" })).toThrow(
+    expect(compileContract(c).query.decode({ name: "abc" })).toEqual({
+      name: "abc",
+    });
+    expect(() => compileContract(c).query.decode({ name: "a" })).toThrow(
+      z.ZodError,
+    );
+    expect(() => compileContract(c).query.encode({ name: "abcde" })).toThrow(
       z.ZodError,
     );
   });
@@ -405,35 +645,35 @@ describe("path composition", () => {
     const first = base.method("GET").path("/items/:id", params);
     const second = base.path("/members").method("POST");
 
-    expect(base.definition.route).toEqual({
-      method: undefined,
+    expect(compileContract(base.method("GET"))).toMatchObject({
+      method: "GET",
       path: "/organizations/:organizationId/",
     });
-    expect(first.definition.route).toEqual({
+    expect(compileContract(first)).toMatchObject({
       method: "GET",
       path: "/organizations/:organizationId/items/:id",
     });
-    expect(second.definition.route.path).toBe(
+    expect(compileContract(second).path).toBe(
       "/organizations/:organizationId/members",
     );
-    expectTypeOf(first.definition.params.decode).returns.toEqualTypeOf<
+    expectTypeOf(compileContract(first).params.decode).returns.toEqualTypeOf<
       { organizationId: number } & { id: number }
     >();
-    expectTypeOf(second.definition.params.decode).returns.toEqualTypeOf<{
+    expectTypeOf(compileContract(second).params.decode).returns.toEqualTypeOf<{
       organizationId: number;
     }>();
     expect(
-      first.definition.params.decode({ organizationId: "2", id: "7.5" }),
+      compileContract(first).params.decode({ organizationId: "2", id: "7.5" }),
     ).toEqual({ organizationId: 2, id: 7.5 });
     expect(
-      first.definition.params.encode({ organizationId: 2, id: 7.5 }),
+      compileContract(first).params.encode({ organizationId: 2, id: 7.5 }),
     ).toEqual({ organizationId: "2", id: "7.5" });
     for (const incomplete of [{ organizationId: "2" }, { id: "7.5" }]) {
-      expect(() => first.definition.params.decode(incomplete)).toThrow(
+      expect(() => compileContract(first).params.decode(incomplete)).toThrow(
         z.ZodError,
       );
     }
-    expectTypeOf(first.definition.params.encode).toBeCallableWith(
+    expectTypeOf(compileContract(first).params.encode).toBeCallableWith(
       // @ts-expect-error Every fragment's params are required.
       { id: 7.5 },
     );
@@ -451,14 +691,14 @@ describe("path composition", () => {
     ["", "", "/"],
     ["https://example.com/base/", "/:id", "https://example.com/base/:id"],
   ])("joins %s and %s at their boundary", (first, second, expected) => {
-    const base = contract().path(first);
+    const base = contract().method("GET").path(first);
     const chained = base.path(second);
     const merged = base.merge(contract().path(second));
 
-    expect(chained.definition.route.path).toBe(expected);
-    expect(merged.definition.route.path).toBe(expected);
-    expect(merged.merge(contract()).definition.route.path).toBe(expected);
-    expect(contract().merge(merged).definition.route.path).toBe(expected);
+    expect(compileContract(chained).path).toBe(expected);
+    expect(compileContract(merged).path).toBe(expected);
+    expect(compileContract(merged.merge(contract())).path).toBe(expected);
+    expect(compileContract(contract().merge(merged)).path).toBe(expected);
   });
 
   it("appends merged paths in order and permits matching methods", () => {
@@ -466,31 +706,35 @@ describe("path composition", () => {
     const second = contract().method("GET").path("/second");
     const merged = first.merge(second).method("GET").path("/third/");
 
-    expect(merged.definition.route.path).toBe("/first/second/third/");
-    expect(second.merge(first).definition.route.path).toBe("/second/first");
-    expectTypeOf(merged.definition.route.method).toEqualTypeOf<"GET">();
-    expectTypeOf(contract().merge(first).definition.route.method)
-      .toEqualTypeOf<"GET">();
-    expectTypeOf(first.merge(contract()).definition.route.method)
-      .toEqualTypeOf<"GET">();
+    expect(compileContract(merged).path).toBe("/first/second/third/");
+    expect(compileContract(second.merge(first)).path).toBe("/second/first");
+    expectTypeOf(compileContract(merged).method).toEqualTypeOf<"GET">();
+    expectTypeOf(
+      compileContract(contract().merge(first)).method,
+    ).toEqualTypeOf<"GET">();
+    expectTypeOf(
+      compileContract(first.merge(contract())).method,
+    ).toEqualTypeOf<"GET">();
     expect(() => {
       // @ts-expect-error A repeated method must agree with the inherited method.
-      merged.method("POST");
+      compileContract(merged.method("POST"));
     }).toThrow("Cannot compose different methods: GET and POST");
   });
 
   it("rejects repeated parameter names within and across fragments", () => {
     expect(() =>
-      contract().path("/organizations/:id/items/:id", params),
+      compileContract(
+        contract().method("GET").path("/organizations/:id/items/:id", params),
+      ),
     ).toThrow("Duplicate path parameter id");
-    const base = contract().path("/organizations/:id", params);
-    expect(() => base.path("/items/:id", params)).toThrow(
+    const base = contract().method("GET").path("/organizations/:id", params);
+    expect(() => compileContract(base.path("/items/:id", params))).toThrow(
       "Duplicate path parameter id",
     );
-    expect(() => base.merge(contract().path("/items/:id", params))).toThrow(
-      "Duplicate path parameter id",
-    );
-    expect(base.definition.route.path).toBe("/organizations/:id");
+    expect(() =>
+      compileContract(base.merge(contract().path("/items/:id", params))),
+    ).toThrow("Duplicate path parameter id");
+    expect(compileContract(base.method("GET")).path).toBe("/organizations/:id");
   });
 
   it("preserves conflicting param constraints through later composition", () => {
@@ -501,22 +745,22 @@ describe("path composition", () => {
       .merge(contract())
       .path("/:name", zodCodec(z.object({ name: z.string() })));
 
-    expectTypeOf(c.definition.params.decode).returns.toEqualTypeOf<
+    expectTypeOf(compileContract(c).params.decode).returns.toEqualTypeOf<
       { id: string } & { id: number } & { name: string }
     >();
     for (const id of ["2", 2]) {
-      expect(() => c.definition.params.decode({ id, name: "item" })).toThrow(
-        z.ZodError,
-      );
+      expect(() =>
+        compileContract(c).params.decode({ id, name: "item" }),
+      ).toThrow(z.ZodError);
     }
   });
 });
 
 describe("request composition", () => {
   it("intersects bodies when chaining and merging, preserving codecs", () => {
-    const base = contract().request(
-      zodCodec(z.object({ expectedVersion: stringToNumber })),
-    );
+    const base = contract()
+      .method("GET")
+      .request(zodCodec(z.object({ expectedVersion: stringToNumber })));
     const fields = zodCodec(z.object({ at: isoDatetimeToDate }));
     const at = new Date("2026-09-10T12:00:00.000Z");
 
@@ -524,16 +768,18 @@ describe("request composition", () => {
       base.request(fields),
       base.merge(contract().request(fields)),
     ]) {
-      expectTypeOf(c.definition.request.decode).returns.toEqualTypeOf<
+      expectTypeOf(compileContract(c).request.decode).returns.toEqualTypeOf<
         { expectedVersion: number } & { at: Date }
       >();
       expect(
-        c.definition.request.decode({
+        compileContract(c).request.decode({
           expectedVersion: "2",
           at: at.toISOString(),
         }),
       ).toEqual({ expectedVersion: 2, at });
-      expect(c.definition.request.encode({ expectedVersion: 2, at })).toEqual({
+      expect(
+        compileContract(c).request.encode({ expectedVersion: 2, at }),
+      ).toEqual({
         expectedVersion: "2",
         at: at.toISOString(),
       });
@@ -541,12 +787,16 @@ describe("request composition", () => {
         { expectedVersion: "2" },
         { at: at.toISOString() },
       ]) {
-        expect(() => c.definition.request.decode(incomplete)).toThrow(
+        expect(() => compileContract(c).request.decode(incomplete)).toThrow(
           z.ZodError,
         );
       }
     }
-    expect(base.definition.request.decode({ expectedVersion: "2" })).toEqual({
+    expect(
+      compileContract(base.method("GET")).request.decode({
+        expectedVersion: "2",
+      }),
+    ).toEqual({
       expectedVersion: 2,
     });
     expect(fields.decode({ at: at.toISOString() })).toEqual({ at });
@@ -562,44 +812,58 @@ describe("request composition", () => {
       .merge(contract())
       .request(zodCodec(z.object({ name: z.string() })));
 
-    expectTypeOf(c.definition.request.decode).returns.toEqualTypeOf<
+    expectTypeOf(compileContract(c).request.decode).returns.toEqualTypeOf<
       { version: string } & { version: number } & { name: string }
     >();
     for (const version of ["2", 2]) {
       const input = { version, name: "item" };
-      expect(() => c.definition.request.decode(input)).toThrow(z.ZodError);
+      expect(() => compileContract(c).request.decode(input)).toThrow(
+        z.ZodError,
+      );
       expect(() => {
         // @ts-expect-error Neither a string nor a number satisfies both codecs.
-        c.definition.request.encode(input);
+        compileContract(c).request.encode(input);
       }).toThrow(z.ZodError);
     }
 
     const impossible = contract()
+      .method("POST")
       .request(zodCodec(z.object({ kind: z.literal("a") })))
       .request(zodCodec(z.object({ kind: z.literal("b") })))
       .merge(contract())
       .merge(contract().request(zodCodec(z.object({ name: z.string() }))))
       .request(zodCodec(z.object({ version: z.number() })));
 
-    expectTypeOf(impossible.definition.request.decode).returns.toBeNever();
-    expectTypeOf(impossible.definition.request.encode).parameter(0).toBeNever();
+    expectTypeOf(
+      compileContract(impossible).request.decode,
+    ).returns.toBeNever();
+    expectTypeOf(compileContract(impossible).request.encode)
+      .parameter(0)
+      .toBeNever();
     expect(() =>
-      impossible.definition.request.decode({
-        kind: "a", name: "item", version: 2,
+      compileContract(impossible).request.decode({
+        kind: "a",
+        name: "item",
+        version: 2,
       }),
     ).toThrow(z.ZodError);
   });
 
   it("requires every shared field constraint", () => {
     const c = contract()
+      .method("POST")
       .request(zodCodec(z.object({ name: z.string().min(2) })))
       .merge(
         contract().request(zodCodec(z.object({ name: z.string().max(4) }))),
       );
 
-    expect(c.definition.request.decode({ name: "abc" })).toEqual({ name: "abc" });
-    expect(() => c.definition.request.decode({ name: "a" })).toThrow(z.ZodError);
-    expect(() => c.definition.request.encode({ name: "abcde" })).toThrow(
+    expect(compileContract(c).request.decode({ name: "abc" })).toEqual({
+      name: "abc",
+    });
+    expect(() => compileContract(c).request.decode({ name: "a" })).toThrow(
+      z.ZodError,
+    );
+    expect(() => compileContract(c).request.encode({ name: "abcde" })).toThrow(
       z.ZodError,
     );
   });
@@ -631,7 +895,7 @@ describe("request composition", () => {
       headers: new Headers(),
     };
     const middleware = createMiddleware()(
-      { params: base.definition.params, request: base.definition.request },
+      base,
       async (req, _server, _context, next) => {
         expectTypeOf(req.params).toEqualTypeOf<{ organization: string }>();
         expectTypeOf(req.body).toEqualTypeOf<{ expectedVersion: number }>();
@@ -670,9 +934,9 @@ describe("request composition", () => {
       },
     }).contract(final);
 
-    expectTypeOf(fetchItem).parameter(0).toEqualTypeOf<
-      Parameters<typeof endpoint.handle>[0]
-    >();
+    expectTypeOf(fetchItem)
+      .parameter(0)
+      .toEqualTypeOf<Parameters<typeof endpoint.handle>[0]>();
     expectTypeOf(fetchItem).returns.resolves.toEqualTypeOf<{
       status: 200;
       body: { name: string; at: Date };
@@ -688,18 +952,22 @@ describe("request composition", () => {
       body: { at, name: "item" },
     });
     await expect(fetchItem(input)).resolves.toEqual({
-      status: 200, body: { name: "item", at },
+      status: 200,
+      body: { name: "item", at },
     });
     await expect(endpoint.handle(input, {})).resolves.toEqual({
-      status: 200, body: { name: "item", at },
+      status: 200,
+      body: { name: "item", at },
     });
-    await expect(endpoint.fetchWithContext(
-      new Request("https://example.com/organizations/one/items/7.5", {
-        method: "POST",
-        body: JSON.stringify({ at: at.toISOString(), name: "item" }),
-      }),
-      {},
-    )).rejects.toThrow(z.ZodError);
+    await expect(
+      endpoint.fetchWithContext(
+        new Request("https://example.com/organizations/one/items/7.5", {
+          method: "POST",
+          body: JSON.stringify({ at: at.toISOString(), name: "item" }),
+        }),
+        {},
+      ),
+    ).rejects.toThrow(z.ZodError);
   });
 });
 
@@ -745,7 +1013,7 @@ describe("contract merge", () => {
         status: 201;
         body: { created: boolean };
       }>();
-      expect(merged.definition.route).toEqual({
+      expect(compileContract(merged)).toMatchObject({
         method: "POST",
         path: "/items/:id",
       });
@@ -758,31 +1026,43 @@ describe("contract merge", () => {
         }),
       ).resolves.toEqual({ status: 201, body: { created: true } });
     }
-    expect(empty.definition.route.method).toBeUndefined();
-    expect(empty.definition.query.decode({})).toEqual({});
-    expect(empty.definition.request.decode(undefined)).toBeUndefined();
-    expect(empty.definition.responses).toEqual({});
+    expect(empty).not.toHaveProperty("definition");
+    expect(compileContract(empty.method("GET")).query.decode({})).toEqual({});
+    expect(
+      compileContract(empty.method("GET")).request.decode(undefined),
+    ).toBeUndefined();
+    expect(compileContract(empty.method("GET")).responses).toEqual({});
   });
 
   it("allows configuration after merging empty bases", () => {
     const merged = contract().merge(contract());
-    expectTypeOf(merged.definition.route.method).toBeUndefined();
-    expectTypeOf(merged.definition.query.decode).returns.toEqualTypeOf<
-      Record<string, never>
-    >();
-    expectTypeOf(merged.definition.request.decode).returns.toBeUndefined();
+    expect(() => {
+      // @ts-expect-error Merging empty builders does not provide a method.
+      compileContract(merged);
+    }).toThrow("Contract must define a method with .method()");
+    expectTypeOf(
+      compileContract(merged.method("GET")).query.decode,
+    ).returns.toEqualTypeOf<Record<string, never>>();
+    expectTypeOf(
+      compileContract(merged.method("GET")).request.decode,
+    ).returns.toBeUndefined();
 
     const configured = merged
+      .method("GET")
       .query(zodCodec(z.object({ page: stringToNumber })))
       .merge(contract().request(zodCodec(z.boolean())));
-    expectTypeOf(configured.definition.query.decode).returns.toEqualTypeOf<{
+    expectTypeOf(
+      compileContract(configured).query.decode,
+    ).returns.toEqualTypeOf<{
       page: number;
     }>();
-    expectTypeOf(configured.definition.request.decode).returns.toBeBoolean();
-    expect(configured.definition.query.decode({ page: "2" })).toEqual({
+    expectTypeOf(
+      compileContract(configured).request.decode,
+    ).returns.toBeBoolean();
+    expect(compileContract(configured).query.decode({ page: "2" })).toEqual({
       page: 2,
     });
-    expect(configured.definition.request.decode(true)).toBe(true);
+    expect(compileContract(configured).request.decode(true)).toBe(true);
   });
 
   it("combines a route and a request body from separate bases", () => {
@@ -790,18 +1070,24 @@ describe("contract merge", () => {
     const body = contract().request(zodCodec(z.object({ name: z.string() })));
 
     for (const merged of [route.merge(body), body.merge(route)]) {
-      expectTypeOf(merged.definition.params.decode).returns.toEqualTypeOf<{
+      expectTypeOf(
+        compileContract(merged).params.decode,
+      ).returns.toEqualTypeOf<{
         id: number;
       }>();
-      expectTypeOf(merged.definition.request.decode).returns.toEqualTypeOf<{
+      expectTypeOf(
+        compileContract(merged).request.decode,
+      ).returns.toEqualTypeOf<{
         name: string;
       }>();
-      expect(merged.definition.route).toEqual({
+      expect(compileContract(merged)).toMatchObject({
         method: "POST",
         path: "/items/:id",
       });
-      expect(merged.definition.params.decode({ id: "7" })).toEqual({ id: 7 });
-      expect(merged.definition.request.decode({ name: "item" })).toEqual({
+      expect(compileContract(merged).params.decode({ id: "7" })).toEqual({
+        id: 7,
+      });
+      expect(compileContract(merged).request.decode({ name: "item" })).toEqual({
         name: "item",
       });
     }
@@ -817,17 +1103,18 @@ describe("contract merge", () => {
 
     expect(() => {
       // @ts-expect-error GET and POST cannot be composed.
-      first.merge(second);
+      compileContract(first.merge(second));
     }).toThrow("Cannot compose different methods: GET and POST");
     expect(() => {
       // @ts-expect-error An inherited method must still agree.
-      inherited.merge(second);
+      compileContract(inherited.merge(second));
     }).toThrow("Cannot compose different methods: GET and POST");
   });
 
   it("preserves an explicit undefined body as a constraint", () => {
-    const body = contract().request(zodCodec(z.object({ name: z.string() })));
-    const noBody = contract().request(zodCodec(z.undefined()));
+    const bodyCodec = zodCodec(z.object({ name: z.string() }));
+    const body = contract().method("POST").request(bodyCodec);
+    const noBody = contract().method("POST").request(zodCodec(z.undefined()));
     const inherited = contract()
       .merge(body)
       .query(zodCodec(z.object({ page: stringToNumber })))
@@ -835,26 +1122,30 @@ describe("contract merge", () => {
       .method("POST")
       .path("/items/:id", params);
 
-    expect(body.merge(body).definition.request.decode({ name: "item" })).toEqual({
+    expect(
+      compileContract(body.merge(body)).request.decode({ name: "item" }),
+    ).toEqual({
       name: "item",
     });
     expect(
-      noBody.merge(noBody).definition.request.decode(undefined),
+      compileContract(noBody.merge(noBody)).request.decode(undefined),
     ).toBeUndefined();
     for (const merged of [
       body.merge(noBody),
       noBody.merge(body),
       inherited.merge(noBody),
-      noBody.request(body.definition.request),
+      noBody.request(bodyCodec),
     ]) {
-      expectTypeOf(merged.definition.request.decode).returns.toBeNever();
-      expectTypeOf(merged.definition.request.encode).parameter(0).toBeNever();
-      expect(() => merged.definition.request.decode(undefined)).toThrow(
+      expectTypeOf(compileContract(merged).request.decode).returns.toBeNever();
+      expectTypeOf(compileContract(merged).request.encode)
+        .parameter(0)
+        .toBeNever();
+      expect(() => compileContract(merged).request.decode(undefined)).toThrow(
         z.ZodError,
       );
-      expect(() => merged.definition.request.decode({ name: "item" })).toThrow(
-        z.ZodError,
-      );
+      expect(() =>
+        compileContract(merged).request.decode({ name: "item" }),
+      ).toThrow(z.ZodError);
     }
   });
 });

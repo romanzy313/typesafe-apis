@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import z from "zod";
+import { compileContract } from "../contract.js";
 import { exampleContract } from "./contract.js";
 import { serverEndpoint } from "../server.js";
 import { exampleHandler } from "./serverHandler.js";
@@ -52,7 +53,7 @@ describe("example", () => {
   });
 
   it("uses the same path codec in both directions", () => {
-    const { params } = exampleContract.definition;
+    const { params } = compileContract(exampleContract);
     expect(params.decode({ pathParam: "42.5" })).toEqual({
       pathParam: 42.5,
     });
@@ -101,7 +102,7 @@ describe("example", () => {
 describe("example types", () => {
   it("preserves schema output types through the codec adapter", () => {
     const codec = zodCodec(z.stringbool());
-    const { definition } = exampleContract;
+    const definition = compileContract(exampleContract);
 
     expectTypeOf(codec).toEqualTypeOf<Codec<boolean>>();
     expectTypeOf(definition.params.decode).returns.toEqualTypeOf<{
@@ -138,8 +139,9 @@ describe("example types", () => {
   });
 
   it("rejects the original example's missing response field", () => {
+    const builder = serverEndpoint().contract(exampleContract);
     // @ts-expect-error The success body requires hi, not notWorking.
-    serverEndpoint().contract(exampleContract).handler(async (req) => ({
+    builder.handler(async (req) => ({
       status: 200,
       body: {
         notWorking: "",

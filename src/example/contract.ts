@@ -26,10 +26,7 @@ const base = contract()
 export const exampleContract = base
   .merge(auth)
   .method("POST")
-  .path(
-    "/:pathParam",
-    zodCodec(z.object({ pathParam: stringToNumber })),
-  )
+  .path("/:pathParam", zodCodec(z.object({ pathParam: stringToNumber })))
   .request(zodCodec(z.object({ requestParam: z.boolean() })))
   .response(
     200,

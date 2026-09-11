@@ -1,6 +1,6 @@
+import type { ContractBuilder, ContractState } from "./contract.js";
 import type { EndpointHandler } from "./server.js";
 import type {
-  Codec,
   ContractResponse,
   RequestContext,
   ResponseCodecs,
@@ -34,7 +34,7 @@ export type MiddlewareHandler<
 };
 
 /**
- * Define reusable middleware from the codecs it requires.
+ * Infer middleware requirements from a builder without compiling it.
  * Omitted request parts are unknown; omitted responses allow only next().
  */
 export function createMiddleware<
@@ -42,35 +42,24 @@ export function createMiddleware<
   TRequestContext extends object = {},
   TRequestContextNext extends object = {},
 >() {
-  return <
-    TParams = unknown,
-    TQuery = unknown,
-    TRequestBody = unknown,
-    TResponses extends ResponseCodecs = {},
-  >(
-    _requirements: {
-      params?: Codec<TParams>;
-      query?: Codec<TQuery>;
-      request?: Codec<TRequestBody>;
-      responses?: TResponses &
-        Record<Exclude<keyof TResponses, StatusCode>, never>;
-    },
+  return <TState extends ContractState>(
+    _requirements: ContractBuilder<TState>,
     handler: NoInfer<
       MiddlewareHandler<
-        TParams,
-        TQuery,
-        TRequestBody,
-        TResponses,
+        TState["hasParams"] extends true ? TState["params"] : unknown,
+        TState["hasQuery"] extends true ? TState["query"] : unknown,
+        TState["hasRequest"] extends true ? TState["request"] : unknown,
+        TState["responses"],
         TServerContext,
         TRequestContext,
         TRequestContextNext
       >
     >,
   ): MiddlewareHandler<
-    TParams,
-    TQuery,
-    TRequestBody,
-    TResponses,
+    TState["hasParams"] extends true ? TState["params"] : unknown,
+    TState["hasQuery"] extends true ? TState["query"] : unknown,
+    TState["hasRequest"] extends true ? TState["request"] : unknown,
+    TState["responses"],
     TServerContext,
     TRequestContext,
     TRequestContextNext
@@ -83,7 +72,8 @@ type OptionalKeys<T> = {
 
 type OptionalContext<TCurrent, TNext> = {
   [TKey in keyof TCurrent]:
-    TCurrent[TKey] | Required<TNext>[TKey & keyof TNext];
+    | TCurrent[TKey]
+    | Required<TNext>[TKey & keyof TNext];
 };
 
 // Optional updates can be absent, so overlapping fields retain their old type.

@@ -1,8 +1,12 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import z from "zod";
 import { zodCodec } from "./codec.js";
-import { contract } from "./contract.js";
-import { contractHandler, serverEndpoint, type ServerEndpoint } from "./server.js";
+import { compileContract, contract, type InferResponses } from "./contract.js";
+import {
+  contractHandler,
+  serverEndpoint,
+  type ServerEndpoint,
+} from "./server.js";
 import type { RequestContext, StatusCode, TypedRequest } from "./types.js";
 
 const date = new Date("2026-09-09T12:00:00.000Z");
@@ -24,13 +28,15 @@ function createContract(path = "/items/:id") {
     .response(200, zodCodec(isoDatetimeToDate))
     .response(400, zodCodec(z.object({ error: z.string() })));
 
-  vi.spyOn(c.definition.params, "decode").mockReturnValue({ id: 42 });
-  vi.spyOn(c.definition.query, "decode").mockReturnValue({ filter: "a" });
-  vi.spyOn(c.definition.request, "decode").mockReturnValue({ enabled: true });
-  vi.spyOn(c.definition.responses[200], "encode");
-  vi.spyOn(c.definition.responses[200], "decode").mockReturnValue(date);
-  vi.spyOn(c.definition.responses[400], "encode");
-  vi.spyOn(c.definition.responses[400], "decode").mockReturnValue({
+  vi.spyOn(compileContract(c).params, "decode").mockReturnValue({ id: 42 });
+  vi.spyOn(compileContract(c).query, "decode").mockReturnValue({ filter: "a" });
+  vi.spyOn(compileContract(c).request, "decode").mockReturnValue({
+    enabled: true,
+  });
+  vi.spyOn(compileContract(c).responses[200], "encode");
+  vi.spyOn(compileContract(c).responses[200], "decode").mockReturnValue(date);
+  vi.spyOn(compileContract(c).responses[400], "encode");
+  vi.spyOn(compileContract(c).responses[400], "decode").mockReturnValue({
     error: "Invalid item",
   });
   return c;
@@ -42,6 +48,15 @@ function createRequest(url = "https://example.com/items/42?filter=a") {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ enabled: true }),
   });
+}
+
+function inputsFrom(c: ReturnType<typeof createContract>) {
+  const definition = compileContract(c);
+  return contract()
+    .method(definition.method)
+    .path(definition.path, definition.params)
+    .query(definition.query)
+    .request(definition.request);
 }
 
 describe("serverEndpoint", () => {
@@ -93,16 +108,20 @@ describe("serverEndpoint", () => {
 
     const response = await endpoint.handle(request, {});
 
-    expect(handler).toHaveBeenCalledExactlyOnceWith(request, {}, {
-      headers: new Headers(),
-    });
+    expect(handler).toHaveBeenCalledExactlyOnceWith(
+      request,
+      {},
+      {
+        headers: new Headers(),
+      },
+    );
     expect(response).toEqual({ status: 200, body: date });
     expect(response.body).toBe(date);
-    expect(c.definition.params.decode).not.toHaveBeenCalled();
-    expect(c.definition.query.decode).not.toHaveBeenCalled();
-    expect(c.definition.request.decode).not.toHaveBeenCalled();
-    expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
-    expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
+    expect(compileContract(c).params.decode).not.toHaveBeenCalled();
+    expect(compileContract(c).query.decode).not.toHaveBeenCalled();
+    expect(compileContract(c).request.decode).not.toHaveBeenCalled();
+    expect(compileContract(c).responses[200].encode).not.toHaveBeenCalled();
+    expect(compileContract(c).responses[400].encode).not.toHaveBeenCalled();
   });
 
   it("decodes requests and encodes responses with the selected codec", async () => {
@@ -113,18 +132,18 @@ describe("serverEndpoint", () => {
 
     const response = await endpoint.fetchWithContext(createRequest(), {});
 
-    expect(endpoint.definition).toBe(c.definition);
-    expect(endpoint.definition.route.method).toBe("POST");
-    expect(endpoint.definition.route.path).toBe("/items/:id");
+    expect(endpoint.definition).toEqual(compileContract(c));
+    expect(endpoint.definition.method).toBe("POST");
+    expect(endpoint.definition.path).toBe("/items/:id");
     expect(endpoint).not.toHaveProperty("method");
     expect(endpoint).not.toHaveProperty("path");
-    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(compileContract(c).params.decode).toHaveBeenCalledExactlyOnceWith({
       id: "42",
     });
-    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(compileContract(c).query.decode).toHaveBeenCalledExactlyOnceWith({
       filter: "a",
     });
-    expect(c.definition.request.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(compileContract(c).request.decode).toHaveBeenCalledExactlyOnceWith({
       enabled: true,
     });
     expect(handler).toHaveBeenCalledExactlyOnceWith(
@@ -137,11 +156,11 @@ describe("serverEndpoint", () => {
       {},
       { headers: new Headers() },
     );
-    expect(c.definition.responses[200].encode).toHaveBeenCalledExactlyOnceWith(
-      date,
-    );
-    expect(c.definition.responses[200].decode).not.toHaveBeenCalled();
-    expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
+    expect(
+      compileContract(c).responses[200].encode,
+    ).toHaveBeenCalledExactlyOnceWith(date);
+    expect(compileContract(c).responses[200].decode).not.toHaveBeenCalled();
+    expect(compileContract(c).responses[400].encode).not.toHaveBeenCalled();
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("application/json");
     expect(await response.json()).toBe(date.toISOString());
@@ -160,20 +179,18 @@ describe("serverEndpoint", () => {
 
     expect(response.status).toBe(400);
     expect(await response.json()).toEqual(body);
-    expect(c.definition.responses[400].encode).toHaveBeenCalledExactlyOnceWith(
-      body,
-    );
-    expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
+    expect(
+      compileContract(c).responses[400].encode,
+    ).toHaveBeenCalledExactlyOnceWith(body);
+    expect(compileContract(c).responses[200].encode).not.toHaveBeenCalled();
   });
 
   it("supports a contract declaring only status 201", async () => {
     const original = createContract();
-    const c = {
-      definition: {
-        ...original.definition,
-        responses: { 201: original.definition.responses[200] },
-      },
-    };
+    const c = inputsFrom(original).response(
+      201,
+      compileContract(original).responses[200],
+    );
     const builder = serverEndpoint().contract(c);
     const endpoint = builder.handler(async () => ({
       status: 201,
@@ -184,23 +201,19 @@ describe("serverEndpoint", () => {
 
     expect(response.status).toBe(201);
     expect(await response.json()).toBe(date.toISOString());
-    expectTypeOf(endpoint.handle)
-      .returns.resolves.toEqualTypeOf<{ status: 201; body: Date }>();
+    expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<{
+      status: 201;
+      body: Date;
+    }>();
   });
 
   it.each([404, 500] as const)(
     "supports status %s in a contract declaring only error responses",
     async (status) => {
       const original = createContract();
-      const c = {
-        definition: {
-          ...original.definition,
-          responses: {
-            404: original.definition.responses[400],
-            500: original.definition.responses[400],
-          },
-        },
-      };
+      const c = inputsFrom(original)
+        .response(404, compileContract(original).responses[400])
+        .response(500, compileContract(original).responses[400]);
       const body = { error: "Request failed" };
       const builder = serverEndpoint().contract(c);
       const endpoint = builder.handler(async () => ({ status, body }));
@@ -240,11 +253,11 @@ describe("serverEndpoint", () => {
       {},
     );
 
-    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(compileContract(c).params.decode).toHaveBeenCalledExactlyOnceWith({
       group: "a/b",
       id: "hello world",
     });
-    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({
+    expect(compileContract(c).query.decode).toHaveBeenCalledExactlyOnceWith({
       filter: "hello world",
       extra: "a/b",
     });
@@ -256,13 +269,14 @@ describe("serverEndpoint", () => {
     vi.spyOn(request, "decode");
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
     const endpoint = serverEndpoint()
-      .contract({
-        definition: {
-          ...c.definition,
-          route: { method: "GET", path: "/items" },
-          request,
-        },
-      })
+      .contract(
+        contract()
+          .method("GET")
+          .path("/items", compileContract(c).params)
+          .query(compileContract(c).query)
+          .request(request)
+          .response(200, compileContract(c).responses[200]),
+      )
       .handler(handler);
 
     await endpoint.fetchWithContext(
@@ -270,8 +284,10 @@ describe("serverEndpoint", () => {
       {},
     );
 
-    expect(c.definition.params.decode).toHaveBeenCalledExactlyOnceWith({});
-    expect(c.definition.query.decode).toHaveBeenCalledExactlyOnceWith({});
+    expect(compileContract(c).params.decode).toHaveBeenCalledExactlyOnceWith(
+      {},
+    );
+    expect(compileContract(c).query.decode).toHaveBeenCalledExactlyOnceWith({});
     expect(request.decode).toHaveBeenCalledExactlyOnceWith(undefined);
     expect(handler).toHaveBeenCalledExactlyOnceWith(
       {
@@ -290,19 +306,19 @@ describe("serverEndpoint", () => {
     async (part) => {
       const c = createContract();
       const error = new Error(`Invalid ${part}`);
-      vi.mocked(c.definition[part].decode).mockImplementation(() => {
+      vi.mocked(compileContract(c)[part].decode).mockImplementation(() => {
         throw error;
       });
       const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
       const builder = serverEndpoint().contract(c);
       const endpoint = builder.handler(handler);
 
-      await expect(
-        endpoint.fetchWithContext(createRequest(), {}),
-      ).rejects.toBe(error);
+      await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
+        error,
+      );
       expect(handler).not.toHaveBeenCalled();
-      expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
-      expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
+      expect(compileContract(c).responses[200].encode).not.toHaveBeenCalled();
+      expect(compileContract(c).responses[400].encode).not.toHaveBeenCalled();
     },
   );
 
@@ -353,16 +369,18 @@ describe("serverEndpoint", () => {
     await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
       error,
     );
-    expect(c.definition.responses[200].encode).not.toHaveBeenCalled();
-    expect(c.definition.responses[400].encode).not.toHaveBeenCalled();
+    expect(compileContract(c).responses[200].encode).not.toHaveBeenCalled();
+    expect(compileContract(c).responses[400].encode).not.toHaveBeenCalled();
   });
 
   it("propagates response encoding failures", async () => {
     const c = createContract();
     const error = new Error("Invalid response");
-    vi.mocked(c.definition.responses[200].encode).mockImplementation(() => {
-      throw error;
-    });
+    vi.mocked(compileContract(c).responses[200].encode).mockImplementation(
+      () => {
+        throw error;
+      },
+    );
     const builder = serverEndpoint().contract(c);
     const endpoint = builder.handler(async () => ({
       status: 200,
@@ -387,15 +405,9 @@ describe("serverEndpoint types", () => {
 
   it("infers response bodies only for the declared subset", () => {
     const original = createContract();
-    const c = {
-      definition: {
-        ...original.definition,
-        responses: {
-          201: original.definition.responses[200],
-          503: original.definition.responses[400],
-        },
-      },
-    };
+    const c = inputsFrom(original)
+      .response(201, compileContract(original).responses[200])
+      .response(503, compileContract(original).responses[400]);
     const builder = serverEndpoint().contract(c);
     const endpoint = builder.handler(async (req) => {
       if (req.body.enabled) {
@@ -404,10 +416,9 @@ describe("serverEndpoint types", () => {
       return { status: 503, body: { error: "Unavailable" } };
     });
 
-    expectTypeOf(endpoint.handle)
-      .returns.resolves.toEqualTypeOf<
-        { status: 201; body: Date } | { status: 503; body: { error: string } }
-      >();
+    expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<
+      { status: 201; body: Date } | { status: 503; body: { error: string } }
+    >();
 
     // @ts-expect-error Status 200 is not declared by this contract.
     builder.handler(async () => ({ status: 200, body: date }));
@@ -422,25 +433,10 @@ describe("serverEndpoint types", () => {
     builder.handler(async () => ({ status: 503, body: date }));
   });
 
-  it("rejects response maps containing status codes absent from Hono", () => {
+  it("rejects response declarations with status codes absent from Hono", () => {
     const original = createContract();
-    const invalid = {
-      definition: {
-        ...original.definition,
-        responses: {
-          ...original.definition.responses,
-          104: original.definition.responses[200],
-        },
-      },
-    };
-
     // @ts-expect-error Status 104 is absent from Hono's StatusCode.
-    original.response(104, original.definition.responses[200]);
-
-    serverEndpoint()
-      // @ts-expect-error Direct handler construction also rejects status 104.
-      .contract(invalid)
-      .handler(async () => ({ status: 200, body: date }));
+    original.response(104, compileContract(original).responses[200]);
   });
 
   it("infers decoded request values and status-specific response bodies", () => {
@@ -466,24 +462,33 @@ describe("serverEndpoint types", () => {
         { id: number },
         { filter: "a" | "b" },
         { enabled: boolean },
-        typeof c.definition.responses,
-        {}
+        InferResponses<typeof c>,
+        {},
+        "POST"
       >
     >();
     expectTypeOf(endpoint.definition.params.decode).returns.toEqualTypeOf<{
       id: number;
     }>();
-    expectTypeOf(endpoint.definition.responses[200].decode)
-      .returns.toEqualTypeOf<Date>();
-    expectTypeOf<Parameters<typeof builder.handler>[0]>()
-      .returns.resolves.toEqualTypeOf<
-        { status: 200; body: Date } | { status: 400; body: { error: string } }
-      >();
-    expectTypeOf(endpoint.handle).parameters.toEqualTypeOf<[
-      TypedRequest<{ id: number }, { filter: "a" | "b" }, { enabled: boolean }>,
-      Readonly<{}>,
-      (RequestContext | undefined)?,
-    ]>();
+    expectTypeOf(
+      endpoint.definition.responses[200].decode,
+    ).returns.toEqualTypeOf<Date>();
+    expectTypeOf<
+      Parameters<typeof builder.handler>[0]
+    >().returns.resolves.toEqualTypeOf<
+      { status: 200; body: Date } | { status: 400; body: { error: string } }
+    >();
+    expectTypeOf(endpoint.handle).parameters.toEqualTypeOf<
+      [
+        TypedRequest<
+          { id: number },
+          { filter: "a" | "b" },
+          { enabled: boolean }
+        >,
+        Readonly<{}>,
+        (RequestContext | undefined)?,
+      ]
+    >();
     expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<
       { status: 200; body: Date } | { status: 400; body: { error: string } }
     >();
@@ -522,8 +527,12 @@ describe("serverEndpoint types", () => {
     // @ts-expect-error The endpoint requires a Request, not a URL object.
     expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(url, {});
     const options = { method: "POST" };
-    // @ts-expect-error Request options must be supplied to the Request itself.
-    expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(request, {}, options);
+    expectTypeOf(endpoint.fetchWithContext).toBeCallableWith(
+      request,
+      {},
+      // @ts-expect-error Request options must be supplied to the Request itself.
+      options,
+    );
   });
 
   it("narrows the response body by status", async () => {

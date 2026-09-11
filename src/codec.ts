@@ -8,6 +8,11 @@ export function zodCodec<TInput>(schema: z.ZodType<TInput>): Codec<TInput> {
 class ZodCodec<TInput> implements Codec<TInput> {
   constructor(private readonly schema: z.ZodType<TInput>) {}
 
+  compile(): Codec<TInput> {
+    // Keep Zod's validation and transformations intact until optimizations exist.
+    return this;
+  }
+
   encode(value: TInput): unknown {
     return this.schema.encode(value);
   }

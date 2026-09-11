@@ -1,4 +1,9 @@
 import {
+  compileContract,
+  type ContractBuilder,
+  type ReadyContractState,
+} from "./contract.js";
+import {
   composeMiddleware,
   type AddContext,
   type MiddlewareChain,
@@ -6,10 +11,11 @@ import {
 } from "./middleware.js";
 import type {
   Codec,
-  Contract,
+  ContractDefinition,
   ContractResponse,
   RequestContext,
   RequestExtract,
+  RequestMethod,
   ResponseCodecs,
   ResponseExtract,
   TypedRequest,
@@ -21,13 +27,15 @@ export type ServerEndpoint<
   TRequestBody,
   TResponses extends ResponseCodecs,
   TServerContext,
+  TMethod extends RequestMethod = RequestMethod,
 > = {
-  definition: Contract<
+  definition: ContractDefinition<
+    TMethod,
     Codec<TParams>,
     Codec<TQuery>,
     Codec<TRequestBody>,
     TResponses
-  >["definition"];
+  >;
   /** Run middleware and the handler on decoded values. */
   handle(
     request: TypedRequest<TParams, TQuery, TRequestBody>,
@@ -54,25 +62,17 @@ export type EndpointHandler<
 ) => Promise<ContractResponse<NoInfer<TResponses>>>;
 
 export class ServerEndpointBuilder<
-  TParams,
-  TQuery,
-  TRequestBody,
-  TResponses extends ResponseCodecs,
+  TState extends ReadyContractState,
   TServerContext,
   TRequestContext extends object,
 > {
   constructor(
-    readonly contract: Contract<
-      Codec<TParams>,
-      Codec<TQuery>,
-      Codec<TRequestBody>,
-      TResponses
-    >,
+    readonly contract: ContractBuilder<TState>,
     private readonly compose: MiddlewareChain<
-      TParams,
-      TQuery,
-      TRequestBody,
-      TResponses,
+      TState["params"],
+      TState["query"],
+      TState["request"],
+      TState["responses"],
       TServerContext,
       TRequestContext
     >,
@@ -81,20 +81,17 @@ export class ServerEndpointBuilder<
   /** Declare added fields with .use<{ user: User }>(); next merges them in. */
   use<TRequestContextNext extends object = {}>(
     middleware: MiddlewareHandler<
-      TParams,
-      TQuery,
-      TRequestBody,
-      TResponses,
+      TState["params"],
+      TState["query"],
+      TState["request"],
+      TState["responses"],
       TServerContext,
       TRequestContext,
       TRequestContextNext
     >,
   ) {
     return new ServerEndpointBuilder<
-      TParams,
-      TQuery,
-      TRequestBody,
-      TResponses,
+      TState,
       TServerContext,
       AddContext<TRequestContext, TRequestContextNext>
     >(this.contract, composeMiddleware(this.compose, middleware));
@@ -102,10 +99,10 @@ export class ServerEndpointBuilder<
 
   handler(
     handler: EndpointHandler<
-      TParams,
-      TQuery,
-      TRequestBody,
-      TResponses,
+      TState["params"],
+      TState["query"],
+      TState["request"],
+      TState["responses"],
       TServerContext,
       TRequestContext
     >,
@@ -116,53 +113,40 @@ export class ServerEndpointBuilder<
 
 export function serverEndpoint<TServerContext = {}>() {
   return {
-    contract<TParams, TQuery, TRequestBody, TResponses extends ResponseCodecs>(
-      contract: Contract<
-        Codec<TParams>,
-        Codec<TQuery>,
-        Codec<TRequestBody>,
-        TResponses
-      >,
+    contract<TState extends ReadyContractState>(
+      contract: ContractBuilder<TState>,
     ) {
-      return new ServerEndpointBuilder<
-        TParams,
-        TQuery,
-        TRequestBody,
-        TResponses,
-        TServerContext,
-        {}
-      >(contract, (handler) => handler);
+      return new ServerEndpointBuilder<TState, TServerContext, {}>(
+        contract,
+        (handler) => handler,
+      );
     },
   };
 }
 
 /** Bind a composed handler; omitted context gets fresh response headers. */
 export function contractHandler<
-  TParams,
-  TQuery,
-  TRequestBody,
-  TResponses extends ResponseCodecs,
+  TState extends ReadyContractState,
   TServerContext,
 >(
-  contract: Contract<
-    Codec<TParams>,
-    Codec<TQuery>,
-    Codec<TRequestBody>,
-    TResponses
-  >,
+  contract: ContractBuilder<TState>,
   handler: EndpointHandler<
-    TParams,
-    TQuery,
-    TRequestBody,
-    TResponses,
+    TState["params"],
+    TState["query"],
+    TState["request"],
+    TState["responses"],
     TServerContext,
     {}
   >,
-): ServerEndpoint<TParams, TQuery, TRequestBody, TResponses, TServerContext> {
-  const { definition } = contract;
-  if (!definition.route.method) {
-    throw new Error("Contract must define a method with .method()");
-  }
+): ServerEndpoint<
+  TState["params"],
+  TState["query"],
+  TState["request"],
+  TState["responses"],
+  TServerContext,
+  TState["method"]
+> {
+  const definition = compileContract(contract);
 
   function decodeRequest(req: RequestExtract) {
     return {
@@ -184,10 +168,10 @@ export function contractHandler<
   }
 
   async function handle(
-    request: TypedRequest<TParams, TQuery, TRequestBody>,
+    request: TypedRequest<TState["params"], TState["query"], TState["request"]>,
     serverContext: Readonly<TServerContext>,
     requestContext: RequestContext = { headers: new Headers() },
-  ): Promise<ContractResponse<NoInfer<TResponses>>> {
+  ): Promise<ContractResponse<NoInfer<TState["responses"]>>> {
     return handler(request, serverContext, requestContext);
   }
 
@@ -195,13 +179,14 @@ export function contractHandler<
     request: Request,
     serverContext: Readonly<TServerContext>,
   ): Promise<Response> {
-    const requestExtract = await extractJsonRequest(
-      request,
-      definition.route.path,
-    );
+    const requestExtract = await extractJsonRequest(request, definition.path);
     const decodedRequest = decodeRequest(requestExtract);
     const requestContext: RequestContext = { headers: new Headers() };
-    const response = await handle(decodedRequest, serverContext, requestContext);
+    const response = await handle(
+      decodedRequest,
+      serverContext,
+      requestContext,
+    );
     const encodedResponse = encodeResponse({
       ...response,
       headers: requestContext.headers,

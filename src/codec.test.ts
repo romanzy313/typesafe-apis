@@ -13,6 +13,27 @@ const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
 });
 
 describe("zodCodec composition", () => {
+  it("compiles without changing transformations or validation", () => {
+    const codec = zodCodec(
+      z.object({ at: isoDatetimeToDate, name: z.string().min(2) }),
+    );
+    const prepared = codec.compile();
+    const at = new Date("2026-09-10T12:00:00.000Z");
+    expectTypeOf(prepared).toEqualTypeOf<typeof codec>();
+    expect(prepared.encode({ at, name: "ok" })).toEqual({
+      at: at.toISOString(),
+      name: "ok",
+    });
+    expect(prepared.decode({ at: at.toISOString(), name: "ok" })).toEqual({
+      at,
+      name: "ok",
+    });
+    expect(() => prepared.decode({ at: "invalid", name: "ok" })).toThrow(
+      z.ZodError,
+    );
+    expect(() => prepared.encode({ at, name: "x" })).toThrow(z.ZodError);
+  });
+
   it("union preserves discriminated shapes in both directions", () => {
     const first = zodCodec(
       z.object({ error: z.literal("a"), more: z.string() }),

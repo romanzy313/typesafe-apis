@@ -1,6 +1,8 @@
 export type MinFetch = (request: Request) => Promise<Response>;
 
 export type Codec<TInput = unknown> = {
+  /** Prepare the complete codec for reuse when a contract is bound. */
+  compile(): Codec<TInput>;
   encode(data: TInput): unknown;
   decode(encoded: unknown): TInput;
   union<TOther>(other: Codec<TOther>): Codec<TInput | TOther>;
@@ -80,42 +82,19 @@ export type RequestMethod = "GET" | "POST";
 
 export type ResponseCodecs = Partial<Record<StatusCode, Codec>>;
 
-export type ContractRoute<
-  TMethod extends RequestMethod | undefined = RequestMethod,
-> = {
-  readonly method: TMethod;
-  readonly path: string;
-};
-
 export type ContractDefinition<
+  TMethod extends RequestMethod,
   TParams extends Codec,
   TQuery extends Codec,
   TRequestBody extends Codec,
   TResponse extends ResponseCodecs,
-  TMethod extends RequestMethod | undefined = RequestMethod,
 > = {
-  readonly route: ContractRoute<TMethod>;
+  readonly method: TMethod;
+  readonly path: string;
   readonly params: TParams;
   readonly query: TQuery;
   readonly request: TRequestBody;
   readonly responses: TResponse;
-};
-
-export type Contract<
-  TParams extends Codec,
-  TQuery extends Codec,
-  TRequestBody extends Codec,
-  TResponse extends ResponseCodecs,
-> = {
-  readonly definition: ContractDefinition<
-    TParams,
-    TQuery,
-    TRequestBody,
-    TResponse
-  > & {
-    readonly responses: TResponse &
-      Record<Exclude<keyof TResponse, StatusCode>, never>;
-  };
 };
 
 /**
