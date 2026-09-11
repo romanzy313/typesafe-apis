@@ -1,4 +1,8 @@
-import type { ContractBuilder, ContractState } from "./contract.js";
+import type {
+  ContractBuilder,
+  ContractState,
+  MergeResponses,
+} from "./contract.js";
 import type { EndpointHandler } from "./server.js";
 import type {
   ContractResponse,
@@ -10,6 +14,7 @@ import type {
 
 declare const middlewareResponses: unique symbol;
 declare const middlewareVariables: unique symbol;
+declare const middlewareTypes: unique symbol;
 
 /** Type-only evidence of the variables supplied to the continuation. */
 type NextResponse<TVariables extends object> = ValidResponse<
@@ -50,6 +55,75 @@ export type MiddlewareHandler<
   // Keep response requirements when generic continuation types are compared.
   readonly [middlewareResponses]?: ContractResponse<TResponses>;
   readonly [middlewareVariables]?: TRequestVariablesNext;
+};
+
+/** A callable middleware that can be reused in ordered compositions. */
+export type Middleware<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses extends ResponseCodecs,
+  TServerEnvironment,
+  TRequestVariables extends object,
+  TRequestVariablesNext extends object,
+> = MiddlewareHandler<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses,
+  TServerEnvironment,
+  TRequestVariables,
+  TRequestVariablesNext
+> & {
+  // Retain requirements directly so merge does not have to infer codecs from responses.
+  readonly [middlewareTypes]: {
+    params: TParams;
+    query: TQuery;
+    request: TRequestBody;
+    responses: TResponses;
+    env: TServerEnvironment;
+    vars: TRequestVariables;
+    next: TRequestVariablesNext;
+  };
+  /** Run this middleware first, then other, without changing either one. */
+  merge<
+    TParamsOther,
+    TQueryOther,
+    TRequestBodyOther,
+    TResponsesOther extends ResponseCodecs,
+    TServerEnvironmentOther,
+    TRequestVariablesOther extends object,
+    TRequestVariablesNextOther extends object,
+  >(
+    other: Middleware<
+      TParamsOther,
+      TQueryOther,
+      TRequestBodyOther,
+      TResponsesOther,
+      TServerEnvironmentOther,
+      TRequestVariablesOther,
+      TRequestVariablesNextOther
+    > &
+      NoInfer<
+        CompatibleVariables<
+          TRequestVariables,
+          TRequestVariablesNext,
+          TRequestVariablesOther
+        >
+      >,
+  ): Middleware<
+    TParams & TParamsOther,
+    TQuery & TQueryOther,
+    TRequestBody & TRequestBodyOther,
+    MergeResponses<TResponses, TResponsesOther>,
+    TServerEnvironment & TServerEnvironmentOther,
+    RequiredVariables<
+      TRequestVariables,
+      TRequestVariablesNext,
+      TRequestVariablesOther
+    >,
+    AddVariables<TRequestVariablesNext, TRequestVariablesNextOther>
+  >;
 };
 
 export type InferredMiddlewareResult<TResponses extends ResponseCodecs> =
@@ -123,7 +197,7 @@ export function createMiddleware<
             TRequestVariablesNext
           >
         >,
-  ): MiddlewareHandler<
+  ): Middleware<
     TState["hasParams"] extends true ? TState["params"] : unknown,
     TState["hasQuery"] extends true ? TState["query"] : unknown,
     TState["hasRequest"] extends true ? TState["request"] : unknown,
@@ -134,22 +208,42 @@ export function createMiddleware<
       ? InferMiddlewareVariables<TResult>
       : TRequestVariablesNext
   > =>
-    handler as unknown as MiddlewareHandler<
-      TState["hasParams"] extends true ? TState["params"] : unknown,
-      TState["hasQuery"] extends true ? TState["query"] : unknown,
-      TState["hasRequest"] extends true ? TState["request"] : unknown,
-      TState["responses"],
-      TServerEnvironment,
-      TRequestVariables,
-      [TRequestVariablesNext] extends [never]
-        ? InferMiddlewareVariables<TResult>
-        : TRequestVariablesNext
-    >;
+    withMerge(
+      handler as unknown as MiddlewareHandler<
+        TState["hasParams"] extends true ? TState["params"] : unknown,
+        TState["hasQuery"] extends true ? TState["query"] : unknown,
+        TState["hasRequest"] extends true ? TState["request"] : unknown,
+        TState["responses"],
+        TServerEnvironment,
+        TRequestVariables,
+        [TRequestVariablesNext] extends [never]
+          ? InferMiddlewareVariables<TResult>
+          : TRequestVariablesNext
+      >,
+    );
 }
 
 type OptionalKeys<T> = {
   [TKey in keyof T]-?: {} extends Pick<T, TKey> ? TKey : never;
 }[keyof T];
+
+// Only fields supplied on every continuation path can satisfy later requirements.
+type RequiredKeys<T> = Exclude<keyof T, OptionalKeys<T>>;
+type RemainingVariables<TRequired, TAdded> = TRequired extends unknown
+  ? Omit<TRequired, RequiredKeys<TAdded>>
+  : never;
+type RequiredVariables<TCurrent, TAdded, TRequired> = TCurrent &
+  RemainingVariables<TRequired, TAdded>;
+
+type CompatibleVariables<
+  TCurrent extends object,
+  TAdded extends object,
+  TRequired extends object,
+> = [
+  AddVariables<RequiredVariables<TCurrent, TAdded, TRequired>, TAdded>,
+] extends [TRequired]
+  ? unknown
+  : never;
 
 type OptionalVariables<TCurrent, TNext> = {
   [TKey in keyof TCurrent]:
@@ -171,6 +265,87 @@ export type AddVariables<
         >
     : never
   : never;
+
+// The public signatures check requirements; execution only forwards shared context
+// and merges variable additions. No contract compilation is needed here.
+type RuntimeMiddleware = MiddlewareHandler<
+  unknown,
+  unknown,
+  unknown,
+  ResponseCodecs,
+  unknown,
+  object,
+  object
+>;
+
+function withMerge<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses extends ResponseCodecs,
+  TServerEnvironment,
+  TRequestVariables extends object,
+  TRequestVariablesNext extends object,
+>(
+  handler: MiddlewareHandler<
+    TParams,
+    TQuery,
+    TRequestBody,
+    TResponses,
+    TServerEnvironment,
+    TRequestVariables,
+    TRequestVariablesNext
+  >,
+): Middleware<
+  TParams,
+  TQuery,
+  TRequestBody,
+  TResponses,
+  TServerEnvironment,
+  TRequestVariables,
+  TRequestVariablesNext
+> {
+  const run = handler as unknown as RuntimeMiddleware;
+  const callable: RuntimeMiddleware = (context, next) => run(context, next);
+  return Object.assign(callable, {
+    merge(other: RuntimeMiddleware) {
+      return withMerge<
+        unknown,
+        unknown,
+        unknown,
+        ResponseCodecs,
+        unknown,
+        object,
+        object
+      >(async (context, next) =>
+        requireResponse(
+          await run(context, async (firstVariables) =>
+            requireResponse(
+              await other(
+                { ...context, vars: { ...context.vars, ...firstVariables } },
+                async (otherVariables) =>
+                  next({ ...firstVariables, ...otherVariables }),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
+  }) as unknown as Middleware<
+    TParams,
+    TQuery,
+    TRequestBody,
+    TResponses,
+    TServerEnvironment,
+    TRequestVariables,
+    TRequestVariablesNext
+  >;
+}
+
+function requireResponse<TResponse>(response: TResponse): TResponse {
+  if (response === undefined) throw new Error("Middleware returned undefined");
+  return response;
+}
 
 export type MiddlewareChain<
   TParams,
@@ -243,9 +418,6 @@ export function composeMiddleware<
           >,
         }),
       );
-      if (response === undefined) {
-        throw new Error("Middleware returned undefined");
-      }
-      return response;
+      return requireResponse(response);
     });
 }

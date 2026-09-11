@@ -3,7 +3,7 @@ import z from "zod";
 import { createClient } from "./client.js";
 import { zodCodec } from "./codec.js";
 import { compileContract, contract, type InferResponses } from "./contract.js";
-import { createMiddleware, type MiddlewareHandler } from "./middleware.js";
+import { createMiddleware, type Middleware } from "./middleware.js";
 import { contractHandler, serverEndpoint } from "./server.js";
 import type {
   RequestContext,
@@ -213,7 +213,7 @@ describe("createMiddleware", () => {
     });
 
     expectTypeOf(middleware).toEqualTypeOf<
-      MiddlewareHandler<
+      Middleware<
         { id: number },
         { fail: boolean },
         { name: string },
@@ -303,6 +303,402 @@ describe("createMiddleware", () => {
       requirements.response(104, zodCodec(z.string())),
       async (_context, next) => next({}),
     );
+  });
+});
+
+describe("middleware.merge", () => {
+  it("composes callable middleware in order and preserves shared context", async () => {
+    const order: string[] = [];
+    const res = { headers: new Headers() };
+    const params = zodCodec(z.object({ id: stringToNumber }));
+    const compile = vi.spyOn(params, "compile");
+    const first = createMiddleware<{ greeting: string }>()(
+      contract().path("/:id", params),
+      async (context, next) => {
+        expect(context.res).toBe(res);
+        expect(context.env).toBe(env);
+        order.push("first before");
+        const response = await next({
+          traceId: `${context.env.greeting}:${context.req.params.id}`,
+        });
+        expect(context.vars).toEqual({ upstream: true });
+        order.push("first after");
+        context.res.headers.set("x-order", order.join(","));
+        return response;
+      },
+    );
+    const second = createMiddleware<{ userName: string }, TraceVariables>()(
+      authContract,
+      async ({ req, env, vars, res: response }, next) => {
+        expect(vars.traceId).toBe("Hello:7");
+        expect(req.query.fail).toBe(false);
+        expect(response).toBe(res);
+        order.push("second before");
+        const result = await next({ userId: env.userName });
+        order.push("second after");
+        return result;
+      },
+    );
+    const third = createMiddleware<{}, { userId: string }>()(
+      contract().request(zodCodec(z.object({ name: z.string() }))),
+      async ({ req, vars }, next) => {
+        order.push("third before");
+        const response = await next({
+          label: `${vars.userId}:${req.body.name}`,
+        });
+        order.push("third after");
+        return response;
+      },
+    );
+    const merged = first.merge(second).merge(third);
+    expect(merged).toBeTypeOf("function");
+    expect(merged).not.toBe(first);
+    expect(order).toEqual([]);
+    expect(compile).not.toHaveBeenCalled();
+
+    const bound = serverEndpoint<ServerEnvironment>()
+      .contract(testContract)
+      .use((_context, next) => next({ upstream: true }))
+      .use(merged)
+      .handler(async ({ vars, res: response }) => {
+        expectTypeOf(vars.traceId).toEqualTypeOf<string>();
+        expectTypeOf(vars.userId).toEqualTypeOf<string>();
+        expectTypeOf(vars.label).toEqualTypeOf<string>();
+        expectTypeOf(vars.upstream).toEqualTypeOf<boolean>();
+        expect(response).toBe(res);
+        expect(vars).toEqual({
+          upstream: true,
+          traceId: "Hello:7",
+          userId: "Ada",
+          label: "Ada:world",
+        });
+        if (false) {
+          // @ts-expect-error Merged variables remain readonly.
+          vars.userId = "changed";
+        }
+        order.push("handler");
+        return { status: 200, body: { hello: vars.label } };
+      });
+    await expect(
+      bound.handle({
+        req: {
+          params: { id: 7 },
+          query: { fail: false },
+          body: { name: "world" },
+        },
+        env,
+        res,
+      }),
+    ).resolves.toEqual({ status: 200, body: { hello: "Ada:world" } });
+    expect(order).toEqual([
+      "first before",
+      "second before",
+      "third before",
+      "handler",
+      "third after",
+      "second after",
+      "first after",
+    ]);
+    expect(res.headers.get("x-order")).toBe(order.join(","));
+
+    // Composing the right-hand side first keeps the same requirements and outputs.
+    const nested = first.merge(second.merge(third));
+    expectTypeOf(nested).toMatchTypeOf<typeof merged>();
+    serverEndpoint<ServerEnvironment>().contract(testContract).use(nested);
+    serverEndpoint<ServerEnvironment>()
+      .contract(testContract)
+      .use(first)
+      .handler(async ({ vars }) => {
+        // @ts-expect-error The original middleware has no userId addition.
+        expectTypeOf(vars.userId);
+        return { status: 200, body: { hello: vars.traceId } };
+      });
+  });
+
+  it.each(["first", "second", "third", "none"] as const)(
+    "preserves early response alternatives with stop=%s",
+    async (stop) => {
+      const order: string[] = [];
+      const query = contract().query(zodCodec(z.object({ stop: z.string() })));
+      const firstContract = query.response(
+        403,
+        zodCodec(z.object({ error: z.literal("first") })),
+      );
+      const secondContract = query.response(
+        403,
+        zodCodec(z.object({ error: z.literal("second") })),
+      );
+      const thirdContract = query.response(
+        418,
+        zodCodec(z.object({ error: z.literal("third") })),
+      );
+      const first = createMiddleware()(firstContract, async ({ req }, next) => {
+        order.push("first");
+        if (req.query.stop === "first")
+          return { status: 403, body: { error: "first" } };
+        return next({});
+      });
+      const second = createMiddleware()(
+        secondContract,
+        async ({ req }, next) => {
+          order.push("second");
+          if (req.query.stop === "second")
+            return { status: 403, body: { error: "second" } };
+          return next({});
+        },
+      );
+      const third = createMiddleware()(thirdContract, async ({ req }, next) => {
+        order.push("third");
+        if (req.query.stop === "third")
+          return { status: 418, body: { error: "third" } };
+        return next({});
+      });
+      const merged = first.merge(second).merge(third);
+      const ready = firstContract
+        .merge(secondContract)
+        .merge(thirdContract)
+        .method("GET")
+        .response(200, zodCodec(z.string()));
+      const bound = serverEndpoint()
+        .contract(ready)
+        .use(merged)
+        .handler(async () => {
+          order.push("handler");
+          return { status: 200, body: "ok" };
+        });
+      const response = await bound.fetchWithContext(
+        new Request(`https://example.com/?stop=${stop}`),
+        {},
+      );
+      expect(response.status).toBe(
+        stop === "none" ? 200 : stop === "third" ? 418 : 403,
+      );
+      expect(await response.json()).toEqual(
+        stop === "none" ? "ok" : { error: stop },
+      );
+      const steps = ["first", "second", "third", "handler"];
+      expect(order).toEqual(
+        steps.slice(0, stop === "none" ? 4 : steps.indexOf(stop) + 1),
+      );
+      serverEndpoint()
+        .contract(firstContract.merge(thirdContract).method("GET"))
+        // @ts-expect-error Both distinct bodies for 403 must be declared.
+        .use(merged);
+      serverEndpoint()
+        .contract(firstContract.merge(secondContract).method("GET"))
+        // @ts-expect-error The merged middleware can also return 418.
+        .use(merged);
+    },
+  );
+
+  it("retains incoming variable requirements not supplied by earlier middleware", async () => {
+    const first = createMiddleware<{}, { session: string }>()(
+      contract(),
+      (_context, next) => next({ issued: true }),
+    );
+    const second = createMiddleware<{}, { issued: boolean; token: string }>()(
+      contract(),
+      ({ vars }, next) => next({ userId: vars.token }),
+    );
+    const merged = first.merge(second);
+    const base = serverEndpoint().contract(testContract);
+    // @ts-expect-error Both session and token must exist before the merged middleware.
+    base.use(merged);
+    // @ts-expect-error Satisfying the first middleware alone is insufficient.
+    base.use((_context, next) => next({ session: "s" })).use(merged);
+    const bound = base
+      .use((_context, next) => next({ session: "s", token: "Ada" }))
+      .use(merged)
+      .handler(async ({ vars }) => {
+        expectTypeOf(vars.session).toEqualTypeOf<string>();
+        expectTypeOf(vars.token).toEqualTypeOf<string>();
+        expectTypeOf(vars.issued).toEqualTypeOf<boolean>();
+        expectTypeOf(vars.userId).toEqualTypeOf<string>();
+        return { status: 200, body: { hello: vars.userId } };
+      });
+    expect(
+      await (await bound.fetchWithContext(createRequest(), {})).json(),
+    ).toEqual({ hello: "Ada" });
+  });
+
+  it("checks the combined request and environment requirements", () => {
+    const first = createMiddleware<{ greeting: string }>()(
+      contract().path("/:id", zodCodec(z.object({ id: stringToNumber }))),
+      (_context, next) => next({}),
+    );
+    const second = createMiddleware<{ userName: string }>()(
+      authContract.request(zodCodec(z.object({ name: z.string() }))),
+      (_context, next) => next({}),
+    );
+    const merged = first.merge(second);
+    expectTypeOf(merged)
+      .parameter(0)
+      .toHaveProperty("req")
+      .toEqualTypeOf<
+        ServerRequest<{ id: number }, { fail: boolean }, { name: string }>
+      >();
+    serverEndpoint<ServerEnvironment>().contract(testContract).use(merged);
+    // @ts-expect-error The second middleware requires userName in the environment.
+    serverEndpoint<{ greeting: string }>().contract(testContract).use(merged);
+    // @ts-expect-error The first middleware requires greeting in the environment.
+    serverEndpoint<{ userName: string }>().contract(testContract).use(merged);
+    serverEndpoint<ServerEnvironment>()
+      .contract(authContract.method("GET"))
+      // @ts-expect-error The composed middleware requires numeric id and a body with name.
+      .use(merged);
+
+    const noBody = createMiddleware()(
+      contract().request(zodCodec(z.undefined())),
+      (_context, next) => next({}),
+    );
+    const neutral = createMiddleware()(contract(), (_context, next) =>
+      next({}),
+    );
+    const noBodyMerged = neutral.merge(noBody);
+    expectTypeOf(noBodyMerged)
+      .parameter(0)
+      .toHaveProperty("req")
+      .toHaveProperty("body")
+      .toBeUndefined();
+    // @ts-expect-error An explicit absent body requirement survives merging.
+    serverEndpoint().contract(testContract).use(noBodyMerged);
+  });
+
+  it("replaces variables in order and supports branching reusable compositions", async () => {
+    const first = createMiddleware()(contract(), (_context, next) =>
+      next({ traceId: "first" }),
+    );
+    const second = createMiddleware()(contract(), (_context, next) =>
+      next({ traceId: 42 }),
+    );
+    const third = createMiddleware<{}, { traceId: number }>()(
+      contract(),
+      ({ vars }, next) => next({ label: String(vars.traceId) }),
+    );
+    const merged = first.merge(second).merge(third);
+    const base = serverEndpoint().contract(testContract);
+    const replaced = base.use(merged).handler(async ({ vars }) => {
+      expectTypeOf(vars.traceId).toEqualTypeOf<number>();
+      expectTypeOf(vars.label).toEqualTypeOf<string>();
+      return { status: 200, body: { hello: vars.label } };
+    });
+    const original = base.use(first).handler(async ({ vars }) => {
+      expectTypeOf(vars.traceId).toEqualTypeOf<string>();
+      return { status: 200, body: { hello: vars.traceId } };
+    });
+    const responses = await Promise.all(
+      [replaced, original].map((endpoint) =>
+        endpoint.fetchWithContext(createRequest(), {}),
+      ),
+    );
+    expect(await responses[0]!.json()).toEqual({ hello: "42" });
+    expect(await responses[1]!.json()).toEqual({ hello: "first" });
+  });
+
+  it.each([false, true])(
+    "preserves conditional variable additions with fail=%s",
+    async (fail) => {
+      const first = createMiddleware()(contract(), (_context, next) =>
+        next({ traceId: "first" }),
+      );
+      const conditional = createMiddleware()(authContract, ({ req }, next) =>
+        req.query.fail ? next({ traceId: 42, userId: "Ada" }) : next({}),
+      );
+      const bound = serverEndpoint()
+        .contract(testContract)
+        .use(first.merge(conditional))
+        .handler(async ({ vars }) => {
+          expectTypeOf(vars.traceId).toEqualTypeOf<string | number>();
+          // @ts-expect-error The userId field is only added on one path.
+          expectTypeOf(vars.userId);
+          if ("userId" in vars)
+            expectTypeOf(vars.userId).toEqualTypeOf<string>();
+          return { status: 200, body: { hello: String(vars.traceId) } };
+        });
+      const response = await bound.fetchWithContext(createRequest(7, fail), {});
+      expect(await response.json()).toEqual({ hello: fail ? "42" : "first" });
+    },
+  );
+
+  it("rejects additions incompatible with later variable requirements", () => {
+    const needsString = createMiddleware<{}, { userId: string }>()(
+      contract(),
+      (_context, next) => next({}),
+    );
+    const number = createMiddleware()(contract(), (_context, next) =>
+      next({ userId: 42 }),
+    );
+    const optionalNumber = createMiddleware<{}, {}, { userId?: number }>()(
+      contract(),
+      (_context, next) => next({}),
+    );
+    const conditionalNumber = createMiddleware()(
+      authContract,
+      ({ req }, next) => (req.query.fail ? next({ userId: 42 }) : next({})),
+    );
+    // @ts-expect-error A required number replacement cannot satisfy a string requirement.
+    number.merge(needsString);
+    // @ts-expect-error A possible number replacement is also incompatible.
+    optionalNumber.merge(needsString);
+    // @ts-expect-error Every continuation branch must be compatible.
+    conditionalNumber.merge(needsString);
+  });
+
+  it.each([false, true])(
+    "retains requirements for optionally supplied variables with fail=%s",
+    async (fail) => {
+      const optional = createMiddleware<{}, {}, { userId?: string }>()(
+        authContract,
+        ({ req }, next) => next(req.query.fail ? { userId: "new" } : {}),
+      );
+      const needsUser = createMiddleware<{}, { userId: string }>()(
+        contract(),
+        ({ vars }, next) => next({ label: vars.userId }),
+      );
+      const merged = optional.merge(needsUser);
+      const base = serverEndpoint().contract(testContract);
+      // @ts-expect-error Optional additions cannot guarantee the userId field exists.
+      base.use(merged);
+      const bound = base
+        .use((_context, next) => next({ userId: "incoming" }))
+        .use(merged)
+        .handler(async ({ vars }) => ({
+          status: 200,
+          body: { hello: vars.label },
+        }));
+      const response = await bound.fetchWithContext(createRequest(7, fail), {});
+      expect(await response.json()).toEqual({
+        hello: fail ? "new" : "incoming",
+      });
+    },
+  );
+
+  it("propagates errors and checks every merged response before unwinding", async () => {
+    const error = new Error("failed");
+    const outer = createMiddleware()(testContract, async (_context, next) => {
+      await next({});
+      return { status: 200, body: { hello: "outer" } };
+    });
+    const throwing = createMiddleware()(contract(), async () => {
+      throw error;
+    });
+    const invalid = createMiddleware()(
+      contract(),
+      // @ts-expect-error Simulate an untyped middleware returning no response.
+      async () => undefined,
+    );
+    for (const [inner, expected] of [
+      [throwing, error],
+      [invalid, new Error("Middleware returned undefined")],
+    ] as const) {
+      const bound = serverEndpoint()
+        .contract(testContract)
+        .use(outer.merge(inner))
+        .handler(async () => ({ status: 200, body: { hello: "handler" } }));
+      await expect(bound.fetchWithContext(createRequest(), {})).rejects.toThrow(
+        expected,
+      );
+    }
   });
 });
 

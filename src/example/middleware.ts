@@ -1,7 +1,7 @@
 import z from "zod";
 import { zodCodec } from "../codec.js";
 import { contract } from "../contract.js";
-import { composeMiddleware, createMiddleware } from "../middleware.js";
+import { createMiddleware } from "../middleware.js";
 import type { ExampleAuthServiceEnvironment } from "./dependencies.js";
 
 export const exampleAuthContract = contract().response(
@@ -32,3 +32,19 @@ export const exampleAuthMiddleware =
       });
     },
   );
+
+const compose1 = createMiddleware()(contract(), ({ vars }, next) =>
+  next({
+    ...vars,
+    compose1: true,
+  }),
+);
+
+const compose2 = createMiddleware()(contract(), ({ vars }, next) =>
+  next({
+    ...vars,
+    compose2: true,
+  }),
+);
+
+export const exampleComposedMiddleware = compose1.merge(compose2);

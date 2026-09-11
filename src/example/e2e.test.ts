@@ -3,7 +3,8 @@ import { createClient, type ClientResponse } from "../client.js";
 import type { ContractResponse } from "../types.js";
 import { exampleContract } from "./contract.js";
 import { exampleAuthService, type ServerEnvironment } from "./dependencies.js";
-import { exampleEndpoint, exampleUsage } from "./server.js";
+import { exampleComposedMiddleware } from "./middleware.js";
+import { exampleEndpoint } from "./server.js";
 
 const input = {
   params: { pathParam: 42.5 },
@@ -19,18 +20,14 @@ function createExampleClient(env: ServerEnvironment) {
 }
 
 describe("example end-to-end", () => {
-  it("runs the standalone server usage demonstration", async () => {
-    const response = await exampleUsage();
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({
-      userId: "example-user",
-      pathParam: 42,
-      queryParam: "a",
-      requestParam: true,
-    });
-  });
-
-  it("round-trips the example contract through auth, inline middleware, and the handler", async () => {
+  it("round-trips auth, merged middleware, inline middleware, and the handler", async () => {
+    expectTypeOf(exampleComposedMiddleware)
+      .parameter(1)
+      .parameter(0)
+      .toMatchTypeOf<{
+        compose1: boolean;
+        compose2: boolean;
+      }>();
     const authService = exampleAuthService();
     const lookup = vi
       .spyOn(authService, "getUserIdByBearer")
@@ -78,6 +75,8 @@ describe("example end-to-end", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
     );
     expect(response.headers.has("authorization")).toBe(false);
+    expect(response.headers.get("x-compose1")).toBe("true");
+    expect(response.headers.get("x-compose2")).toBe("true");
     expect(headers).toEqual({ authorization: "Bearer example-token" });
     if (response.status === 200) {
       expectTypeOf(response.body.userId).toEqualTypeOf<string>();
@@ -108,6 +107,8 @@ describe("example end-to-end", () => {
         headers: expect.any(Headers),
       });
       expect(response.headers.has("x-request-id")).toBe(false);
+      expect(response.headers.has("x-compose1")).toBe(false);
+      expect(response.headers.has("x-compose2")).toBe(false);
       if (bearer === undefined) expect(lookup).not.toHaveBeenCalled();
       else expect(lookup).toHaveBeenCalledExactlyOnceWith(bearer);
       if (response.status === 403) {

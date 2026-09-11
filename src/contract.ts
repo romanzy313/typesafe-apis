@@ -63,7 +63,7 @@ type CompatibleMethods<
     ? never
     : unknown;
 
-type MergeResponses<
+export type MergeResponses<
   TFirst extends ResponseCodecs,
   TSecond extends ResponseCodecs,
 > = {
