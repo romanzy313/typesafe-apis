@@ -9,6 +9,9 @@ export type Codec<TInput = unknown> = {
   intersection<TOther>(other: Codec<TOther>): Codec<TInput & TOther>;
 };
 
+// FIXME: compose StatusCode as an intersection between:
+// StatusCodeOk, StatusCodeError, StatusCodeRedirect, StatusCodeOther.
+
 // Matches Hono's StatusCode
 // https://hono.dev/docs/api/context#status
 // https://github.com/honojs/hono/blob/main/src/utils/http-status.ts
@@ -77,6 +80,8 @@ export type StatusCode =
   | 508 // Loop Detected
   | 510 // Not Extended (obsolete)
   | 511; // Network Authentication Require
+
+export type StatusCodeRedirect = 301 | 302 | 303 | 307 | 308;
 
 export type RequestMethod = "GET" | "POST";
 

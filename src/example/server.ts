@@ -1,3 +1,4 @@
+import { zodCodecRequestErrorResponse } from "../codec.js";
 import { serverEndpoint } from "../server.js";
 import { exampleContract } from "./contract.js";
 import { exampleAuthService, type ServerEnvironment } from "./dependencies.js";
@@ -6,7 +7,23 @@ import {
   exampleComposedMiddleware,
 } from "./middleware.js";
 
-export const exampleEndpoint = serverEndpoint<ServerEnvironment>()
+// Reuse the same environment and invariant handlers for every endpoint.
+export const exampleServer = serverEndpoint<ServerEnvironment>({
+  errors: {
+    request_codec_error({ error }) {
+      const zodErr = zodCodecRequestErrorResponse(error);
+      if (zodErr) return zodErr;
+
+      return Response.json({ error: "codec_error" }, { status: 400 });
+    },
+    internal_server_error({ env }) {
+      // env is accessible here to do logging or whatever
+      return Response.json({ error: "internal_server_error" }, { status: 500 });
+    },
+  },
+});
+
+export const exampleEndpoint = exampleServer
   .contract(exampleContract)
   .use(exampleAuthMiddleware)
   .use(exampleComposedMiddleware)

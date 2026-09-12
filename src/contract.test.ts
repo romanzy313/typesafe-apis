@@ -10,6 +10,7 @@ import {
 } from "./contract.js";
 import { createMiddleware } from "./middleware.js";
 import { serverEndpoint } from "./server.js";
+import { getSidechannelHeader } from "./sidechannel.js";
 import type { ServerRequest } from "./types.js";
 
 const stringToNumber = z.codec(z.string().regex(z.regexes.number), z.number(), {
@@ -971,15 +972,15 @@ describe("request composition", () => {
       status: 200,
       body: { name: "item", at },
     });
-    await expect(
-      endpoint.fetchWithContext(
-        new Request("https://example.com/organizations/one/items/7.5", {
-          method: "POST",
-          body: JSON.stringify({ at: at.toISOString(), name: "item" }),
-        }),
-        {},
-      ),
-    ).rejects.toThrow(z.ZodError);
+    const response = await endpoint.fetchWithContext(
+      new Request("https://example.com/organizations/one/items/7.5", {
+        method: "POST",
+        body: JSON.stringify({ at: at.toISOString(), name: "item" }),
+      }),
+      {},
+    );
+    expect(response.status).toBe(400);
+    expect(getSidechannelHeader(response)).toBe("codec_error");
   });
 });
 

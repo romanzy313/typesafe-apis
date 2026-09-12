@@ -1,5 +1,6 @@
 import { assert, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { createClient, type ClientResponse } from "../client.js";
+import { SidechannelError, sidechannelHeaderKey } from "../sidechannel.js";
 import type { ContractResponse } from "../types.js";
 import { exampleContract } from "./contract.js";
 import { exampleAuthService, type ServerEnvironment } from "./dependencies.js";
@@ -109,6 +110,7 @@ describe("example end-to-end", () => {
       expect(response.headers.has("x-request-id")).toBe(false);
       expect(response.headers.has("x-compose1")).toBe(false);
       expect(response.headers.has("x-compose2")).toBe(false);
+      expect(response.headers.has(sidechannelHeaderKey)).toBe(false);
       if (bearer === undefined) expect(lookup).not.toHaveBeenCalled();
       else expect(lookup).toHaveBeenCalledExactlyOnceWith(bearer);
       if (response.status === 403) {
@@ -133,6 +135,7 @@ describe("example end-to-end", () => {
       headers: expect.any(Headers),
     });
     expect(response.headers.get("x-request-id")).toBeTypeOf("string");
+    expect(response.headers.has(sidechannelHeaderKey)).toBe(false);
     if (response.status === 400) {
       expectTypeOf(response.body).toEqualTypeOf<Readonly<{ error: string }>>();
     }
@@ -168,13 +171,78 @@ describe("example end-to-end", () => {
     expect(new Set(requestIds).size).toBe(2);
   });
 
-  it("propagates authentication service failures", async () => {
+  it("throws a remote internal error for authentication service failures", async () => {
     const error = new Error("Authentication service unavailable");
     const authService = exampleAuthService();
     vi.spyOn(authService, "getUserIdByBearer").mockRejectedValue(error);
     const call = createExampleClient({ authService });
-    await expect(
-      call(input, { headers: { authorization: "Bearer example-user" } }),
-    ).rejects.toBe(error);
+    const result = call(input, {
+      headers: { authorization: "Bearer example-user" },
+    });
+    await expect(result).rejects.toBeInstanceOf(SidechannelError);
+    const failure = await result.catch((error: unknown) => error);
+    assert(failure instanceof SidechannelError);
+    expect(failure.kind).toBe("internal_server_error");
+    expect(failure.response.status).toBe(500);
+    expect(await failure.response.json()).toEqual({
+      error: "internal_server_error",
+    });
+  });
+
+  it("throws a remote codec error when the server receives invalid JSON data", async () => {
+    const call = createClient({
+      baseUrl: "https://example.com",
+      fetch: (request) =>
+        exampleEndpoint.fetchWithContext(
+          new Request(request, {
+            body: JSON.stringify({ requestParam: "invalid" }),
+          }),
+          { authService: exampleAuthService() },
+        ),
+    }).contract(exampleContract);
+
+    const result = call(input);
+    await expect(result).rejects.toBeInstanceOf(SidechannelError);
+    const failure = await result.catch((error: unknown) => error);
+    assert(failure instanceof SidechannelError);
+    expect(failure.kind).toBe("codec_error");
+    expect(failure.response.status).toBe(400);
+    expect(await failure.response.json()).toMatchInlineSnapshot(`
+      {
+        "error": "codec_error",
+        "issues": [
+          {
+            "code": "invalid_type",
+            "expected": "boolean",
+            "message": "Invalid input: expected boolean, received string",
+            "path": [
+              "requestParam",
+            ],
+          },
+        ],
+        "message": "Bad request",
+      }
+    `);
+  });
+
+  it("throws internal error when a service produces an invalid response value", async () => {
+    const authService = exampleAuthService();
+    // @ts-expect-error Simulate a service returning an invalid user ID at runtime.
+    vi.spyOn(authService, "getUserIdByBearer").mockResolvedValue(42);
+    const call = createExampleClient({ authService });
+
+    const result = call(input, {
+      headers: { authorization: "Bearer example-user" },
+    });
+    await expect(result).rejects.toBeInstanceOf(SidechannelError);
+    const failure = await result.catch((error: unknown) => error);
+    assert(failure instanceof SidechannelError);
+    expect(failure.kind).toBe("internal_server_error");
+    expect(failure.response.status).toBe(500);
+    expect(await failure.response.json()).toMatchInlineSnapshot(`
+      {
+        "error": "internal_server_error",
+      }
+    `);
   });
 });

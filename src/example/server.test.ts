@@ -3,13 +3,14 @@ import z from "zod";
 import { zodCodec } from "../codec.js";
 import { compileContract } from "../contract.js";
 import { serverEndpoint } from "../server.js";
+import { getSidechannelHeader } from "../sidechannel.js";
 import type { Codec, RequestContextInput } from "../types.js";
 import { exampleContract } from "./contract.js";
 import {
   exampleAuthService,
   type ExampleAuthServiceEnvironment,
 } from "./dependencies.js";
-import { exampleEndpoint } from "./server.js";
+import { exampleEndpoint, exampleServer } from "./server.js";
 
 const env: ExampleAuthServiceEnvironment = {
   authService: exampleAuthService(),
@@ -92,23 +93,30 @@ describe("example", () => {
       query: "a",
       body: { requestParam: "true" },
     },
-  ])("rejects invalid $name values", async ({ path, query, body }) => {
-    await expect(
-      exampleEndpoint.fetchWithContext(createRequest(path, query, body), env),
-    ).rejects.toBeInstanceOf(z.ZodError);
+  ])("reports invalid $name values", async ({ path, query, body }) => {
+    const response = await exampleEndpoint.fetchWithContext(
+      createRequest(path, query, body),
+      env,
+    );
+    expect(response.status).toBe(400);
+    expect(getSidechannelHeader(response)).toBe("codec_error");
+    expect((await response.json()).message).toBe("Bad request");
   });
 
   it.each([200, 400, 403] as const)(
     "validates the response body for status %s at runtime",
     async (status) => {
       const untypedHandler = async () => ({ status, body: {} });
-      const builder = serverEndpoint().contract(exampleContract);
+      const builder = exampleServer.contract(exampleContract);
       // @ts-expect-error Simulate an untyped caller returning an invalid body.
       const endpoint = builder.handler(untypedHandler);
 
-      await expect(
-        endpoint.fetchWithContext(createRequest(), {}),
-      ).rejects.toBeInstanceOf(z.ZodError);
+      const response = await endpoint.fetchWithContext(createRequest(), env);
+      expect(response.status).toBe(500);
+      expect(getSidechannelHeader(response)).toBe("internal_server_error");
+      expect(await response.json()).toEqual({
+        error: "internal_server_error",
+      });
     },
   );
 });

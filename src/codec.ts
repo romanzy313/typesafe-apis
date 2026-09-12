@@ -5,6 +5,20 @@ export function zodCodec<TInput>(schema: z.ZodType<TInput>): Codec<TInput> {
   return new ZodCodec(schema);
 }
 
+export function zodCodecRequestErrorResponse(error: unknown): Response | null {
+  if (error instanceof z.ZodError) {
+    return Response.json(
+      {
+        error: "codec_error",
+        message: "Bad request",
+        issues: error.issues,
+      },
+      { status: 400 },
+    );
+  }
+  return null;
+}
+
 class ZodCodec<TInput> implements Codec<TInput> {
   constructor(private readonly schema: z.ZodType<TInput>) {}
 

@@ -247,8 +247,7 @@ type CompatibleVariables<
 
 type OptionalVariables<TCurrent, TNext> = {
   [TKey in keyof TCurrent]:
-    | TCurrent[TKey]
-    | Required<TNext>[TKey & keyof TNext];
+    TCurrent[TKey] | Required<TNext>[TKey & keyof TNext];
 };
 
 // Optional updates can be absent, so overlapping fields retain their old type.

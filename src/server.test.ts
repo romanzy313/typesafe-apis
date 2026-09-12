@@ -5,9 +5,13 @@ import { compileContract, contract, type InferResponses } from "./contract.js";
 import {
   contractHandler,
   serverEndpoint,
+  type ServerErrorContext,
   type ServerEndpoint,
+  type ServerEndpointOptions,
 } from "./server.js";
+import { getSidechannelHeader } from "./sidechannel.js";
 import type {
+  ReadonlyHeaders,
   RequestContextInput,
   ServerRequest,
   StatusCode,
@@ -226,7 +230,7 @@ describe("serverEndpoint", () => {
     },
   );
 
-  it("rejects undeclared statuses returned by an untyped handler", async () => {
+  it("marks undeclared statuses returned by an untyped handler as internal errors", async () => {
     const handler = async () => ({
       status: 500 as const,
       body: { error: "Request failed" },
@@ -235,9 +239,9 @@ describe("serverEndpoint", () => {
     // @ts-expect-error Status 500 is standard but absent from this contract.
     const endpoint = builder.handler(handler);
 
-    await expect(
-      endpoint.fetchWithContext(createRequest(), {}),
-    ).rejects.toThrow("No encoder for status 500");
+    const response = await endpoint.fetchWithContext(createRequest(), {});
+    expect(response.status).toBe(500);
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
   });
 
   it("extracts multiple decoded path parameters and query values", async () => {
@@ -304,7 +308,7 @@ describe("serverEndpoint", () => {
   });
 
   it.each(["params", "query", "request"] as const)(
-    "propagates %s decoding failures before calling the handler",
+    "handles %s decoding failures before calling the handler",
     async (part) => {
       const c = createContract();
       const error = new Error(`Invalid ${part}`);
@@ -315,9 +319,13 @@ describe("serverEndpoint", () => {
       const builder = serverEndpoint().contract(c);
       const endpoint = builder.handler(handler);
 
-      await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
-        error,
-      );
+      const response = await endpoint.fetchWithContext(createRequest(), {});
+      expect(response.status).toBe(400);
+      expect(getSidechannelHeader(response)).toBe("codec_error");
+      expect(await response.json()).toEqual({
+        error: "codec_error",
+        message: error.message,
+      });
       expect(handler).not.toHaveBeenCalled();
       expect(compileContract(c).responses[200].encode).not.toHaveBeenCalled();
       expect(compileContract(c).responses[400].encode).not.toHaveBeenCalled();
@@ -325,42 +333,42 @@ describe("serverEndpoint", () => {
   );
 
   it.each(["/other/42", "/items", "/items/", "/items/42/extra"])(
-    "rejects a mismatched path: %s",
+    "handles failed path extraction as a request codec error: %s",
     async (path) => {
       const c = createContract();
       const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
       const builder = serverEndpoint().contract(c);
       const endpoint = builder.handler(handler);
 
-      await expect(
-        endpoint.fetchWithContext(
-          createRequest(`https://example.com${path}`),
-          {},
-        ),
-      ).rejects.toThrow("Request path does not match /items/:id");
+      const response = await endpoint.fetchWithContext(
+        createRequest(`https://example.com${path}`),
+        {},
+      );
+      expect(response.status).toBe(400);
+      expect(getSidechannelHeader(response)).toBe("codec_error");
       expect(handler).not.toHaveBeenCalled();
     },
   );
 
-  it("rejects malformed JSON before calling the handler", async () => {
+  it("handles malformed JSON before calling the handler", async () => {
     const handler = vi.fn(async () => ({ status: 200 as const, body: date }));
     const endpoint = serverEndpoint()
       .contract(createContract())
       .handler(handler);
 
-    await expect(
-      endpoint.fetchWithContext(
-        new Request("https://example.com/items/42", {
-          method: "POST",
-          body: "{",
-        }),
-        {},
-      ),
-    ).rejects.toBeInstanceOf(SyntaxError);
+    const response = await endpoint.fetchWithContext(
+      new Request("https://example.com/items/42", {
+        method: "POST",
+        body: "{",
+      }),
+      {},
+    );
+    expect(response.status).toBe(400);
+    expect(getSidechannelHeader(response)).toBe("codec_error");
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it("propagates handler failures without encoding a response", async () => {
+  it("handles uncaught failures without encoding a contract response", async () => {
     const c = createContract();
     const error = new Error("Handler failed");
     const builder = serverEndpoint().contract(c);
@@ -368,14 +376,18 @@ describe("serverEndpoint", () => {
       throw error;
     });
 
-    await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
-      error,
-    );
+    const response = await endpoint.fetchWithContext(createRequest(), {});
+    expect(response.status).toBe(500);
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
+    expect(await response.json()).toEqual({
+      error: "internal_server_error",
+      message: "Internal server error",
+    });
     expect(compileContract(c).responses[200].encode).not.toHaveBeenCalled();
     expect(compileContract(c).responses[400].encode).not.toHaveBeenCalled();
   });
 
-  it("propagates response encoding failures", async () => {
+  it("handles response encoding failures as internal errors", async () => {
     const c = createContract();
     const error = new Error("Invalid response");
     vi.mocked(compileContract(c).responses[200].encode).mockImplementation(
@@ -389,13 +401,254 @@ describe("serverEndpoint", () => {
       body: date,
     }));
 
-    await expect(endpoint.fetchWithContext(createRequest(), {})).rejects.toBe(
-      error,
-    );
+    const response = await endpoint.fetchWithContext(createRequest(), {});
+    expect(response.status).toBe(500);
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
+    expect(await response.json()).toEqual({
+      error: "internal_server_error",
+      message: "Internal server error",
+    });
   });
 });
 
+describe("serverEndpoint error handlers", () => {
+  it("passes the request codec error, environment, and raw metadata to an async handler", async () => {
+    const c = createContract();
+    const error = new Error("Codec failed");
+    vi.mocked(compileContract(c).request.decode).mockImplementation(() => {
+      throw error;
+    });
+    const env = { label: "custom error" };
+    const request_codec_error = vi.fn(
+      async (context: ServerErrorContext<typeof env>) =>
+        new Response(context.env.label, { status: 422 }),
+    );
+    const endpoint = serverEndpoint<typeof env>({
+      errors: { request_codec_error },
+    })
+      .contract(c)
+      .use((_context, next) => next({ userId: "user" }))
+      .handler(async () => ({ status: 200, body: date }));
+    const request = createRequest();
+
+    const response = await endpoint.fetchWithContext(request, env);
+
+    expect(request_codec_error).toHaveBeenCalledExactlyOnceWith({
+      error,
+      env,
+      request: { method: "POST", url: request.url, headers: request.headers },
+    });
+    expect(request_codec_error.mock.calls[0]![0].env).toBe(env);
+    expect(response.status).toBe(422);
+    expect(getSidechannelHeader(response)).toBe("codec_error");
+    expect(await response.text()).toBe("custom error");
+  });
+
+  it("handles JSON serialization failures as internal errors", async () => {
+    const c = createContract();
+    vi.mocked(compileContract(c).responses[200].encode).mockReturnValue(1n);
+    const internal_server_error = vi.fn(
+      (context: ServerErrorContext<{}>) => {
+        expect(context.error).toBeInstanceOf(TypeError);
+        return new Response("Cannot serialize response", { status: 500 });
+      },
+    );
+    const endpoint = serverEndpoint({
+      errors: { internal_server_error },
+    })
+      .contract(c)
+      .handler(async () => ({ status: 200, body: date }));
+
+    const response = await endpoint.fetchWithContext(createRequest(), {});
+
+    expect(internal_server_error).toHaveBeenCalledOnce();
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
+    expect(response.status).toBe(500);
+  });
+
+  it("reuses handlers across contracts and treats application Zod errors as internal errors", async () => {
+    const error = new z.ZodError([]);
+    const env = { log: vi.fn() };
+    const internal_server_error = vi.fn(
+      async (context: ServerErrorContext<typeof env>) => {
+        context.env.log(context.error, context.request.url);
+        return new Response("Service unavailable", { status: 503 });
+      },
+    );
+    const server = serverEndpoint<typeof env>({
+      errors: { internal_server_error },
+    });
+    const first = server
+      .contract(createContract())
+      .use(async () => {
+        throw error;
+      })
+      .handler(async () => ({ status: 200, body: date }));
+    const second = server
+      .contract(
+        contract()
+          .method("GET")
+          .path("/second")
+          .response(200, zodCodec(z.string())),
+      )
+      .handler(async () => {
+        throw error;
+      });
+    const requests = [
+      createRequest(),
+      new Request("https://example.com/second"),
+    ];
+
+    const responses = await Promise.all([
+      first.fetchWithContext(requests[0]!, env),
+      second.fetchWithContext(requests[1]!, env),
+    ]);
+
+    for (const response of responses) {
+      expect(response.status).toBe(503);
+      expect(getSidechannelHeader(response)).toBe("internal_server_error");
+      expect(await response.text()).toBe("Service unavailable");
+    }
+    expect(internal_server_error).toHaveBeenCalledTimes(2);
+    for (const request of requests) {
+      expect(env.log).toHaveBeenCalledWith(error, request.url);
+    }
+    await expect(
+      first.handle({
+        req: {
+          params: { id: 42 },
+          query: { filter: "a" },
+          body: { enabled: true },
+        },
+        env,
+      }),
+    ).rejects.toBe(error);
+    expect(internal_server_error).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { kind: "codec_error", asynchronous: false },
+    { kind: "codec_error", asynchronous: true },
+    { kind: "internal_server_error", asynchronous: false },
+    { kind: "internal_server_error", asynchronous: true },
+  ] as const)(
+    "uses a fixed fallback when $kind fails (async=$asynchronous)",
+    async ({ kind, asynchronous }) => {
+      const failed = vi.fn((): Response | Promise<Response> => {
+        const error = new Error("Error handler failed");
+        if (asynchronous) return Promise.reject(error);
+        throw error;
+      });
+      const other = vi.fn(() => new Response("Should not be called"));
+      const endpoint = serverEndpoint({
+        errors: {
+          request_codec_error: kind === "codec_error" ? failed : other,
+          internal_server_error:
+            kind === "internal_server_error" ? failed : other,
+        },
+      })
+        .contract(createContract())
+        .handler(async () => {
+          throw new Error("Handler failed");
+        });
+      const request =
+        kind === "codec_error"
+          ? new Request("https://example.com/items/42", {
+              method: "POST",
+              body: "{",
+            })
+          : createRequest();
+
+      const response = await endpoint.fetchWithContext(request, {});
+
+      expect(response.status).toBe(500);
+      expect(getSidechannelHeader(response)).toBe("internal_server_error");
+      expect(await response.json()).toEqual({
+        error: "internal_server_error",
+        message: "Internal server error",
+      });
+      expect(failed).toHaveBeenCalledOnce();
+      expect(other).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe("serverEndpoint types", () => {
+  it("types invariant contexts without changing contract inference", () => {
+    type Env = { label: string };
+    const server = serverEndpoint<Env>({
+      errors: {
+        request_codec_error: (context) => {
+          expectTypeOf(context).toEqualTypeOf<ServerErrorContext<Env>>();
+          expectTypeOf(context.error).toBeUnknown();
+          expectTypeOf(context.env).toEqualTypeOf<Readonly<Env>>();
+          expectTypeOf(
+            context.request.headers,
+          ).toEqualTypeOf<ReadonlyHeaders>();
+          if (false) {
+            // @ts-expect-error Error contexts have no validated request data.
+            context.request.body;
+            // @ts-expect-error Middleware variables may not have been initialized.
+            context.vars;
+            // @ts-expect-error Error context fields are readonly.
+            context.error = null;
+            // @ts-expect-error Environment properties are readonly.
+            context.env.label = "changed";
+            // @ts-expect-error Request metadata is readonly.
+            context.request.url = "changed";
+            // @ts-expect-error Request headers are readonly.
+            context.request.headers.set("x-test", "changed");
+          }
+          return new Response(context.env.label, { status: 422 });
+        },
+        internal_server_error: async (context) => {
+          expectTypeOf(context).toEqualTypeOf<ServerErrorContext<Env>>();
+          return new Response("Failure", { status: 500 });
+        },
+      },
+    });
+    const c = contract()
+      .method("GET")
+      .path("/test")
+      .response(200, zodCodec(z.string()));
+    const endpoint = server
+      .contract(c)
+      .use((context, next) => {
+        expectTypeOf(context.env).toEqualTypeOf<Readonly<Env>>();
+        return next({ label: context.env.label });
+      })
+      .handler(async ({ vars }) => ({ status: 200, body: vars.label }));
+
+    expectTypeOf(endpoint.handle).returns.resolves.toEqualTypeOf<{
+      status: 200;
+      body: string;
+    }>();
+    expectTypeOf(endpoint.fetchWithContext)
+      .parameter(1)
+      .toEqualTypeOf<Readonly<Env>>();
+    expectTypeOf<
+      keyof NonNullable<ServerEndpointOptions["errors"]>
+    >().toEqualTypeOf<"request_codec_error" | "internal_server_error">();
+    if (false) {
+      server
+        .contract(c)
+        // @ts-expect-error Invariant response statuses are not added to the contract.
+        .handler(async () => ({ status: 422, body: "failure" }));
+      serverEndpoint({
+        errors: {
+          // @ts-expect-error Error handlers must return native responses.
+          request_codec_error: () => ({ status: 400, body: "failure" }),
+        },
+      });
+      serverEndpoint({
+        errors: {
+          // @ts-expect-error Async error handlers must also return a response.
+          internal_server_error: async () => undefined,
+        },
+      });
+    }
+  });
+
   it("keeps server input readonly and server output mutable", async () => {
     const c = contract()
       .method("POST")

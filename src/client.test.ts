@@ -3,6 +3,7 @@ import z from "zod";
 import { createClient, type ClientRequestOptions } from "./client.js";
 import { zodCodec } from "./codec.js";
 import { contract } from "./contract.js";
+import { sidechannelHeaderKey, SidechannelError } from "./sidechannel.js";
 import type { MinFetch, ReadonlyHeaders } from "./types.js";
 
 const isoDatetimeToDate = z.codec(z.iso.datetime(), z.date(), {
@@ -303,6 +304,54 @@ describe("createClient", () => {
     }).contract(itemContract);
 
     await expect(fetchItem(input)).rejects.toBe(error);
+  });
+
+  it.each([
+    { kind: "codec_error", status: 400 },
+    { kind: "internal_server_error", status: 500 },
+  ] as const)(
+    "throws $kind before reading or decoding HTTP $status",
+    async ({ kind, status }) => {
+      const response = new Response("Not JSON", {
+        status,
+        headers: { [sidechannelHeaderKey]: kind },
+      });
+      const fetchItem = createClient({
+        baseUrl: "https://example.com",
+        fetch: async () => response,
+      }).contract(itemContract);
+
+      const result = fetchItem(input);
+      await expect(result).rejects.toBeInstanceOf(SidechannelError);
+      const error = await result.catch((error: unknown) => error);
+      assert(error instanceof SidechannelError);
+      expect(error.kind).toBe(kind);
+      expect(error.response).toBe(response);
+      expect(response.bodyUsed).toBe(false);
+      expect(await error.response.text()).toBe("Not JSON");
+      expectTypeOf(error.kind).toEqualTypeOf<
+        "codec_error" | "internal_server_error"
+      >();
+    },
+  );
+
+  it("ignores unrecognized sidechannel values", async () => {
+    const fetchItem = createClient({
+      baseUrl: "https://example.com",
+      fetch: async () =>
+        Response.json(
+          { createdAt: date.toISOString() },
+          {
+            status: 201,
+            headers: { [sidechannelHeaderKey]: "future_error" },
+          },
+        ),
+    }).contract(itemContract);
+
+    expect(await fetchItem(input)).toMatchObject({
+      status: 201,
+      body: { createdAt: date },
+    });
   });
 
   it.each([500, 599])("rejects undeclared status %s", async (status) => {

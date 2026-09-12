@@ -12,10 +12,17 @@ import {
   type MiddlewareChain,
   type MiddlewareHandler,
 } from "./middleware.js";
+import {
+  RedirectError,
+  redirectResponse,
+  type SidechannelHeaderValue,
+  withSidechannel,
+} from "./sidechannel.js";
 import type {
   Codec,
   ContractDefinition,
   ContractResponse,
+  ReadonlyHeaders,
   RequestContext,
   RequestContextInput,
   RequestExtract,
@@ -24,6 +31,27 @@ import type {
   ResponseExtract,
   ServerRequest,
 } from "./types.js";
+
+export type ServerErrorContext<TServerEnvironment> = {
+  readonly error: unknown;
+  readonly env: Readonly<TServerEnvironment>;
+  readonly request: {
+    readonly method: string;
+    readonly url: string;
+    readonly headers: ReadonlyHeaders;
+  };
+};
+
+export type ServerEndpointOptions<TServerEnvironment = {}> = {
+  readonly errors?: {
+    readonly request_codec_error?: (
+      context: ServerErrorContext<TServerEnvironment>,
+    ) => Response | Promise<Response>;
+    readonly internal_server_error?: (
+      context: ServerErrorContext<TServerEnvironment>,
+    ) => Response | Promise<Response>;
+  };
+};
 
 export type ServerEndpoint<
   TParams,
@@ -40,7 +68,7 @@ export type ServerEndpoint<
     Codec<TRequestBody>,
     TResponses
   >;
-  /** Run middleware and the handler on decoded values. */
+  /** Run decoded values through middleware and the handler; uncaught errors reject. */
   handle(
     context: RequestContextInput<
       TParams,
@@ -49,6 +77,7 @@ export type ServerEndpoint<
       TServerEnvironment
     >,
   ): Promise<ContractResponse<NoInfer<TResponses>>>;
+  /** Convert transport and uncaught application errors into marked responses. */
   fetchWithContext(
     request: Request,
     env: Readonly<TServerEnvironment>,
@@ -87,6 +116,7 @@ export class ServerEndpointBuilder<
       TServerEnvironment,
       TRequestVariables
     >,
+    private readonly options: ServerEndpointOptions<TServerEnvironment> = {},
   ) {}
 
   /** Infer additions from return next(...), or declare them with .use<Variables>(). */
@@ -157,6 +187,7 @@ export class ServerEndpointBuilder<
           TRequestVariablesNext
         >,
       ),
+      this.options,
     );
   }
 
@@ -170,11 +201,14 @@ export class ServerEndpointBuilder<
       TRequestVariables
     >,
   ) {
-    return contractHandler(this.contract, this.compose(handler));
+    return contractHandler(this.contract, this.compose(handler), this.options);
   }
 }
 
-export function serverEndpoint<TServerEnvironment = {}>() {
+/** Share an environment type and invariant handlers across contracts. */
+export function serverEndpoint<TServerEnvironment = {}>(
+  options: ServerEndpointOptions<TServerEnvironment> = {},
+) {
   return {
     contract<TState extends ReadyContractState>(
       contract: ContractBuilder<TState>,
@@ -182,6 +216,7 @@ export function serverEndpoint<TServerEnvironment = {}>() {
       return new ServerEndpointBuilder<TState, TServerEnvironment, {}>(
         contract,
         (handler) => handler,
+        options,
       );
     },
   };
@@ -201,6 +236,7 @@ export function contractHandler<
     TServerEnvironment,
     {}
   >,
+  options: ServerEndpointOptions<NoInfer<TServerEnvironment>> = {},
 ): ServerEndpoint<
   TState["params"],
   TState["query"],
@@ -210,6 +246,11 @@ export function contractHandler<
   TState["method"]
 > {
   const definition = compileContract(contract);
+
+  const codecErrorHandler =
+    options.errors?.request_codec_error ?? defaultCodecError;
+  const internalServerErrorHandler =
+    options.errors?.internal_server_error ?? defaultInternalServerError;
 
   function decodeRequest(req: RequestExtract) {
     return {
@@ -250,23 +291,94 @@ export function contractHandler<
     request: Request,
     env: Readonly<TServerEnvironment>,
   ): Promise<Response> {
-    const requestExtract = await extractJsonRequest(request, definition.path);
-    // Expose the decoded values through the server's readonly input view.
-    const decodedRequest = decodeRequest(requestExtract) as ServerRequest<
-      TState["params"],
-      TState["query"],
-      TState["request"]
-    >;
-    const res = { headers: new Headers() };
-    const response = await handle({ req: decodedRequest, env, res });
-    const encodedResponse = encodeResponse({
-      ...response,
-      headers: res.headers,
-    });
-    return createJsonResponse(encodedResponse);
+    const context = {
+      env,
+      request: {
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+      },
+    };
+    try {
+      let decodedRequest: ServerRequest<
+        TState["params"],
+        TState["query"],
+        TState["request"]
+      >;
+      try {
+        const requestExtract = await extractJsonRequest(
+          request,
+          definition.path,
+        );
+        decodedRequest = decodeRequest(requestExtract) as ServerRequest<
+          TState["params"],
+          TState["query"],
+          TState["request"]
+        >;
+      } catch (error) {
+        return createErrorResponse("codec_error", () =>
+          codecErrorHandler({ ...context, error }),
+        );
+      }
+
+      const res = { headers: new Headers() };
+
+      const response = await handle({ req: decodedRequest, env, res });
+
+      try {
+        const encodedResponse = encodeResponse({
+          ...response,
+          headers: res.headers,
+        });
+        return createJsonResponse(encodedResponse);
+      } catch (error) {
+        return createErrorResponse("internal_server_error", () =>
+          internalServerErrorHandler({ ...context, error }),
+        );
+      }
+    } catch (error) {
+      if (error instanceof RedirectError) {
+        return redirectResponse(error);
+      }
+      return createErrorResponse("internal_server_error", () =>
+        internalServerErrorHandler({ ...context, error }),
+      );
+    }
   }
 
   return { definition, handle, fetchWithContext };
+}
+
+function defaultCodecError({ error }: ServerErrorContext<unknown>): Response {
+  return Response.json(
+    {
+      error: "codec_error",
+      message: error instanceof Error ? error.message : String(error),
+    },
+    { status: 400 },
+  );
+}
+
+function defaultInternalServerError(): Response {
+  return Response.json(
+    { error: "internal_server_error", message: "Internal server error" },
+    { status: 500 },
+  );
+}
+
+async function createErrorResponse(
+  kind: SidechannelHeaderValue,
+  respond: () => Response | Promise<Response>,
+): Promise<Response> {
+  try {
+    return withSidechannel(kind, await respond());
+  } catch {
+    // A failing error handler must not invoke another user error handler.
+    return withSidechannel(
+      "internal_server_error",
+      defaultInternalServerError(),
+    );
+  }
 }
 
 async function extractJsonRequest(

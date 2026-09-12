@@ -4,6 +4,7 @@ import {
   type InferRequest,
   type ReadyContractState,
 } from "./contract.js";
+import { getSidechannelHeader, SidechannelError } from "./sidechannel.js";
 import type {
   Codec,
   ContractResponse,
@@ -120,6 +121,10 @@ export function createClient(opts: ClientOptions = {}): Client {
         );
 
         const response = await fetch(request);
+        const sidechannel = getSidechannelHeader(response);
+        if (sidechannel !== null) {
+          throw new SidechannelError(sidechannel, response);
+        }
         const responseExtract = await extractJsonResponse(response);
 
         return decodeResponse(responseExtract);

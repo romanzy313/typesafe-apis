@@ -5,6 +5,7 @@ import { zodCodec } from "./codec.js";
 import { compileContract, contract, type InferResponses } from "./contract.js";
 import { createMiddleware, type Middleware } from "./middleware.js";
 import { contractHandler, serverEndpoint } from "./server.js";
+import { getSidechannelHeader, sidechannelHeaderKey } from "./sidechannel.js";
 import type {
   RequestContext,
   ReadonlyHeaders,
@@ -695,14 +696,71 @@ describe("middleware.merge", () => {
         .contract(testContract)
         .use(outer.merge(inner))
         .handler(async () => ({ status: 200, body: { hello: "handler" } }));
-      await expect(bound.fetchWithContext(createRequest(), {})).rejects.toThrow(
-        expected,
-      );
+      const response = await bound.fetchWithContext(createRequest(), {});
+      expect(getSidechannelHeader(response)).toBe("internal_server_error");
+      await expect(
+        bound.handle({
+          req: {
+            params: { id: 7 },
+            query: { fail: false },
+            body: { name: "world" },
+          },
+          env: {},
+        }),
+      ).rejects.toThrow(expected);
     }
   });
 });
 
 describe("middleware composition", () => {
+  it("returns a declared unhandled_error through composed middleware and the client", async () => {
+    const failures = contract().response(
+      500,
+      zodCodec(z.object({ error: z.literal("unhandled_error") })),
+    );
+    const c = testContract.merge(failures);
+    const handleError = createMiddleware()(failures, async (_context, next) => {
+      try {
+        return await next({});
+      } catch {
+        return { status: 500, body: { error: "unhandled_error" } };
+      }
+    });
+    const addUser = createMiddleware()(contract(), (_context, next) =>
+      next({ userId: "user" }),
+    );
+    const internal_server_error = vi.fn(
+      () => new Response("Invariant failure"),
+    );
+    const endpoint = serverEndpoint({ errors: { internal_server_error } })
+      .contract(c)
+      .use(handleError.merge(addUser))
+      .handler(async ({ vars }) => {
+        expectTypeOf(vars.userId).toEqualTypeOf<string>();
+        throw new Error("Application failed");
+      });
+    const call = createClient({
+      baseUrl: "https://example.com",
+      fetch: (request) => endpoint.fetchWithContext(request, {}),
+    }).contract(c);
+
+    const response = await call({
+      params: { id: 7 },
+      query: { fail: false },
+      body: { name: "world" },
+    });
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: "unhandled_error" });
+    expect(response.headers.has(sidechannelHeaderKey)).toBe(false);
+    expect(internal_server_error).not.toHaveBeenCalled();
+    if (response.status === 500) {
+      expectTypeOf(response.body).toEqualTypeOf<
+        Readonly<{ error: "unhandled_error" }>
+      >();
+    }
+  });
+
   it("keeps variable additions separate from shared HTTP metadata", async () => {
     const res = { headers: new Headers() };
     const bound = serverEndpoint<ServerEnvironment>()
@@ -1120,14 +1178,14 @@ describe("middleware composition", () => {
       body: JSON.stringify({ name: "world" }),
     });
 
-    await expect(bound.fetchWithContext(request, env)).rejects.toBeInstanceOf(
-      z.ZodError,
-    );
+    const response = await bound.fetchWithContext(request, env);
+    expect(response.status).toBe(400);
+    expect(getSidechannelHeader(response)).toBe("codec_error");
     expect(called).not.toHaveBeenCalled();
   });
 
   it.each(["middleware", "handler"] as const)(
-    "propagates %s failures",
+    "reports %s failures over HTTP and propagates them from handle",
     async (source) => {
       const error = new Error("Request failed");
       const bound = serverEndpoint<ServerEnvironment>()
@@ -1140,9 +1198,9 @@ describe("middleware composition", () => {
           throw error;
         });
 
-      await expect(bound.fetchWithContext(createRequest(), env)).rejects.toBe(
-        error,
-      );
+      const response = await bound.fetchWithContext(createRequest(), env);
+      expect(response.status).toBe(500);
+      expect(getSidechannelHeader(response)).toBe("internal_server_error");
       await expect(
         bound.handle({
           req: {
@@ -1164,9 +1222,9 @@ describe("middleware composition", () => {
       .use(async () => ({ status: 500 as const, body: { error: "failed" } }))
       .handler(async () => ({ status: 200, body: { hello: "world" } }));
 
-    await expect(bound.fetchWithContext(createRequest(), env)).rejects.toThrow(
-      "No encoder for status 500",
-    );
+    const response = await bound.fetchWithContext(createRequest(), env);
+    expect(response.status).toBe(500);
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
   });
 
   it("validates a short-circuited response body", async () => {
@@ -1176,9 +1234,9 @@ describe("middleware composition", () => {
       .use(async () => ({ status: 403 as const, body: { error: 42 } }))
       .handler(async () => ({ status: 200, body: { hello: "world" } }));
 
-    await expect(
-      bound.fetchWithContext(createRequest(), env),
-    ).rejects.toBeInstanceOf(z.ZodError);
+    const response = await bound.fetchWithContext(createRequest(), env);
+    expect(response.status).toBe(500);
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
   });
 
   it("rejects middleware that returns no response", async () => {
@@ -1188,9 +1246,9 @@ describe("middleware composition", () => {
       .use(async () => undefined)
       .handler(async () => ({ status: 200, body: { hello: "world" } }));
 
-    await expect(bound.fetchWithContext(createRequest(), env)).rejects.toThrow(
-      "Middleware returned undefined",
-    );
+    const response = await bound.fetchWithContext(createRequest(), env);
+    expect(response.status).toBe(500);
+    expect(getSidechannelHeader(response)).toBe("internal_server_error");
   });
 
   it("requires a method before binding a handler", () => {
